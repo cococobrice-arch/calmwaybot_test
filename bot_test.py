@@ -679,7 +679,10 @@ async def send_final_message(chat_id: int):
         "Адреналин еще сохраняется в теле, но уже перестаёт затмевать разум."
     )
 
-    await bot.send_message(chat_id, thoughts_text, parse_mode="HTML")
+    await bot.send_message(chat_id, thoughts_text, parse_mode="HTML")  
+    
+    
+    
 
 
 
