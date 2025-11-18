@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
@@ -26,6 +26,10 @@ VIDEO_NOTE_FILE_ID = os.getenv("VIDEO_NOTE_FILE_ID")
 DB_PATH = os.getenv("DATABASE_PATH", "users.db")
 CHANNEL_USERNAME = "@OcdAndAnxiety"
 
+MODE = os.getenv("MODE", "prod").lower()  # "prod" или "test"
+TEST_USER_ID = int(os.getenv("TEST_USER_ID", "0") or 0)  # ускоренный режим для конкретного пользователя
+SCHEDULER_POLL_INTERVAL = int(os.getenv("SCHEDULER_POLL_INTERVAL", "10"))  # интервал проверки задач, сек
+
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден в .env")
 
@@ -37,8 +41,9 @@ dp.include_router(router)
 # Тестовые пользователи (полная очистка на /start)
 TEST_USER_IDS = {458421198, 7181765102}
 
+
 # =========================================================
-# 0. БАЗА ДАННЫХ
+# 0. БАЗА ДАННЫХ И ПЛАНИРОВЩИК
 # =========================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -75,6 +80,17 @@ def init_db():
             details TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            send_at TEXT,
+            kind TEXT,
+            payload TEXT,
+            delivered INTEGER DEFAULT 0
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -120,18 +136,199 @@ def upsert_user(user_id: int, step: str = None, subscribed: int = None, username
 
 
 def purge_user(user_id: int):
-    """Полная очистка данных пользователя (для тестовых аккаунтов): users, answers, events."""
+    """Полная очистка данных пользователя (для тестовых аккаунтов): users, answers, events, scheduled_messages."""
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM events WHERE user_id=?", (user_id,))
     cursor.execute("DELETE FROM answers WHERE user_id=?", (user_id,))
     cursor.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+    cursor.execute("DELETE FROM scheduled_messages WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
 
 
-init_db()
+def is_fast_user(user_id: int) -> bool:
+    """
+    Быстрый режим задержек:
+    - если MODE == "test" → для всех
+    - или если user_id == TEST_USER_ID
+    """
+    if MODE == "test":
+        return True
+    if TEST_USER_ID and user_id == TEST_USER_ID:
+        return True
+    return False
 
+
+async def smart_sleep(user_id: int, prod_seconds: int, test_seconds: int = 3):
+    """Асинхронный sleep, который сокращает задержку для тестовых пользователей/режима."""
+    delay = test_seconds if is_fast_user(user_id) else prod_seconds
+    await asyncio.sleep(delay)
+
+
+def schedule_message(user_id: int, prod_seconds: int, kind: str, payload: str = None, test_seconds: int = 3):
+    """
+    Создаём отложенное сообщение в таблице scheduled_messages.
+    prod_seconds — задержка в проде,
+    test_seconds — задержка в тесте/для тестового пользователя.
+    """
+    delay = test_seconds if is_fast_user(user_id) else prod_seconds
+    send_at = datetime.now() + timedelta(seconds=delay)
+    send_at_str = send_at.isoformat(timespec='seconds')
+
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+
+    # Чтобы не плодить дубли — удаляем старые недоставленные задачи такого же типа
+    cursor.execute(
+        "DELETE FROM scheduled_messages WHERE user_id=? AND kind=? AND delivered=0",
+        (user_id, kind)
+    )
+
+    cursor.execute(
+        "INSERT INTO scheduled_messages (user_id, send_at, kind, payload, delivered) VALUES (?, ?, ?, ?, 0)",
+        (user_id, send_at_str, kind, payload)
+    )
+    conn.commit()
+    conn.close()
+
+    log_event(user_id, "scheduled_message_created", f"{kind} @ {send_at_str}")
+
+
+def mark_message_delivered(task_id: int):
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE scheduled_messages SET delivered=1 WHERE id=?",
+        (task_id,)
+    )
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# 0.1. ОБРАБОТКА ОТЛОЖЕННЫХ ЗАДАЧ
+# =========================================================
+async def send_channel_invite(chat_id: int):
+    """Отправка приглашения в канал (только если человек не подписан)."""
+    is_subscribed = False
+    try:
+        member = await bot.get_chat_member(CHANNEL_USERNAME, chat_id)
+        status = getattr(member, "status", None)
+        is_subscribed = status in {"member", "administrator", "creator"}
+        upsert_user(chat_id, subscribed=1 if is_subscribed else 0)
+        log_event(chat_id, "bot_subscription_checked", f"Подписан: {is_subscribed}")
+    except TelegramBadRequest as e:
+        logger.warning(f"Не удалось проверить подписку: {e} (считаем подписанным, приглашение не шлём)")
+        is_subscribed = True
+        log_event(chat_id, "bot_subscription_checked", "Ошибка проверки, считаем подписанным")
+    except Exception as e:
+        logger.warning(f"Сбой проверки подписки: {e} (считаем подписанным, приглашение не шлём)")
+        is_subscribed = True
+        log_event(chat_id, "bot_subscription_checked", "Ошибка проверки (Exception) — считаем подписанным")
+
+    if is_subscribed:
+        # Уже подписан — просто выходим
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Подписаться на канал", url="https://t.me/OcdAndAnxiety")]
+        ]
+    )
+    text = (
+        "У меня есть телеграм-канал, где я делюсь нюансами об эффективных способах преодоления тревоги "
+        "и развеиваю мифы о <i>не</i>работающих методах. "
+        "Никакой воды — только проверенные решения 💧🙅🏻‍♂️\n\n"
+        "Например, я писал там посты:\n\n"
+        "🔸 <a href=\"https://t.me/OcdAndAnxiety/16\">Как неправильное дыхание усиливает паническую атаку</a>\n"
+        "🔸 <a href=\"https://t.me/OcdAndAnxiety/17\">Алкоголь и первый приступ ПА</a>\n"
+        "🔸 <a href=\"https://t.me/OcdAndAnxiety/28\">Каковы опасные цифры давления?</a>\n"
+        "🔸 <a href=\"https://t.me/OcdAndAnxiety/34\">Волшебный газ для успокоения?</a>\n\n"
+        "Подписывайтесь и получайте практические рекомендации 👇🏽"
+    )
+    try:
+        await bot.send_message(
+            chat_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+            disable_web_page_preview=True
+        )
+        log_event(chat_id, "bot_channel_invite_sent", "Отправлено приглашение подписаться на канал")
+    except Exception as e:
+        logger.warning(f"Ошибка отправки приглашения на канал: {e}")
+
+
+# Вперёд объявим сигнатуры, чтобы не ругался линтер/IDE
+async def send_avoidance_intro(chat_id: int):
+    ...
+async def send_case_story(chat_id: int):
+    ...
+async def send_final_message(chat_id: int):
+    ...
+async def send_final_block2(chat_id: int):
+    ...
+async def send_final_block3(chat_id: int):
+    ...
+
+
+async def process_scheduled_message(task_id: int, user_id: int, kind: str, payload: str | None):
+    """Маршрутизация отложенных задач по типу kind."""
+    try:
+        if kind == "channel_invite":
+            await send_channel_invite(user_id)
+        elif kind == "avoidance_intro":
+            await send_avoidance_intro(user_id)
+        elif kind == "case_story":
+            await send_case_story(user_id)
+        elif kind == "final_block1":
+            await send_final_message(user_id)
+        elif kind == "final_block2":
+            await send_final_block2(user_id)
+        elif kind == "final_block3":
+            await send_final_block3(user_id)
+        else:
+            logger.warning(f"Неизвестный тип отложенного сообщения: {kind} для user_id={user_id}")
+            log_event(user_id, "scheduled_message_unknown_kind", kind)
+    finally:
+        # В любом случае помечаем задачу как обработанную, чтобы не зациклиться
+        mark_message_delivered(task_id)
+
+
+async def scheduler_worker():
+    """Фоновый воркер: регулярно проверяет таблицу scheduled_messages и отправляет всё, что пора."""
+    logger.info("Запущен воркер отложенных сообщений.")
+    while True:
+        try:
+            now = datetime.now().isoformat(timespec='seconds')
+            conn = sqlite3.connect(DB_PATH, timeout=10)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, user_id, kind, payload FROM scheduled_messages "
+                "WHERE delivered=0 AND send_at <= ? "
+                "ORDER BY send_at ASC LIMIT 50",
+                (now,)
+            )
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                await asyncio.sleep(SCHEDULER_POLL_INTERVAL)
+                continue
+
+            for task_id, user_id, kind, payload in rows:
+                try:
+                    await process_scheduled_message(task_id, user_id, kind, payload)
+                except Exception as e:
+                    logger.exception(f"Ошибка при обработке задачи {task_id} ({kind}) для user_id={user_id}: {e}")
+                    # Если хотим, можно НЕ помечать как delivered, чтобы попробовать ещё раз
+        except Exception as e:
+            logger.exception(f"Сбой воркера отложенных сообщений: {e}")
+        await asyncio.sleep(SCHEDULER_POLL_INTERVAL)
+
+
+init_db()
 # =========================================================
 # 1. ПРИВЕТСТВИЕ (/start)
 # =========================================================
@@ -169,6 +366,7 @@ async def cmd_start(message: Message):
         reply_markup=kb
     )
 
+
 # =========================================================
 # 2. ОТПРАВКА ГАЙДА
 # =========================================================
@@ -197,64 +395,23 @@ async def send_material(callback: CallbackQuery):
     else:
         await bot.send_message(chat_id, "⚠️ Файл не найден. Попробуйте позже.")
 
-    # Дальнейшая логика — проверка подписки и продолжение сценария
-    asyncio.create_task(check_subscription_and_continue(chat_id))
+    # Планируем: 2) приглашение в канал через 20 минут (если не подписан)
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=20 * 60,
+        test_seconds=5,  # в тесте/для тест-пользователя — быстро
+        kind="channel_invite"
+    )
+
+    # Планируем: 3) приглашение к тесту избегания через сутки после получения материала
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=24 * 60 * 60,
+        test_seconds=5,
+        kind="avoidance_intro"
+    )
+
     await callback.answer()
-
-# =========================================================
-# 3. ПРОВЕРКА ПОДПИСКИ И КОРРЕКТНОЕ ПРОДОЛЖЕНИЕ
-# =========================================================
-async def check_subscription_and_continue(chat_id: int):
-    await asyncio.sleep(1)
-    is_subscribed = False
-    try:
-        member = await bot.get_chat_member(CHANNEL_USERNAME, chat_id)
-        status = getattr(member, "status", None)
-        is_subscribed = status in {"member", "administrator", "creator"}
-        upsert_user(chat_id, subscribed=1 if is_subscribed else 0)
-        log_event(chat_id, "bot_subscription_checked", f"Подписан: {is_subscribed}")
-    except TelegramBadRequest as e:
-        logger.warning(f"Не удалось проверить подписку: {e} (считаем подписанным)")
-        is_subscribed = True
-        log_event(chat_id, "bot_subscription_checked", "Ошибка проверки, принудительно считаем подписанным")
-    except Exception as e:
-        logger.warning(f"Сбой проверки подписки: {e}")
-        is_subscribed = True
-        log_event(chat_id, "bot_subscription_checked", "Ошибка проверки (Exception) — считаем подписанным")
-
-    if not is_subscribed:
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Подписаться на канал", url="https://t.me/OcdAndAnxiety")]
-            ]
-        )
-        text = (
-            "У меня есть телеграм-канал, где я делюсь нюансами об эффективных способах преодоления тревоги "
-            "и развеиваю мифы о <i>не</i>работающих методах. "
-            "Никакой воды — только проверенные решения 💧🙅🏻‍♂️\n\n"
-            "Например, я писал там посты:\n\n"
-            "🔸 <a href=\"https://t.me/OcdAndAnxiety/16\">Как неправильное дыхание усиливает паническую атаку</a>\n"
-            "🔸 <a href=\"https://t.me/OcdAndAnxiety/17\">Алкоголь и первый приступ ПА</a>\n"
-            "🔸 <a href=\"https://t.me/OcdAndAnxiety/28\">Каковы опасные цифры давления?</a>\n"
-            "🔸 <a href=\"https://t.me/OcdAndAnxiety/34\">Волшебный газ для успокоения?</a>\n\n"
-            "Подписывайтесь и получайте практические рекомендации 👇🏽"
-
-
-        )
-        try:
-            await bot.send_message(
-                chat_id,
-                text,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-                disable_web_page_preview=True
-            )
-            log_event(chat_id, "bot_channel_invite_sent", "Отправлено приглашение подписаться на канал")
-        except Exception as e:
-            logger.warning(f"Ошибка отправки приглашения на канал: {e}")
-
-    # ✅ теперь дожидаемся выполнения, а не кидаем в фон
-    await send_after_material(chat_id)
 
 
 # =========================================================
@@ -271,9 +428,6 @@ avoidance_questions = [
     "Избегаете поездок за город, чтобы не оставаться без мобильной связи и интернета? 📶"
 ]
 
-async def send_after_material(chat_id: int):
-    await asyncio.sleep(1)
-    await send_avoidance_intro(chat_id)
 
 async def send_avoidance_intro(chat_id: int):
     text = (
@@ -286,6 +440,7 @@ async def send_avoidance_intro(chat_id: int):
     )
     await bot.send_message(chat_id, text, reply_markup=kb)
     log_event(chat_id, "bot_avoidance_invite_sent", "Предложен опрос избегания")
+
 
 @router.callback_query(F.data == "avoidance_start")
 async def start_avoidance_test(callback: CallbackQuery):
@@ -327,6 +482,7 @@ async def send_question(chat_id: int, index: int):
     ])
     await bot.send_message(chat_id, f"{index + 1}. {q}", reply_markup=kb)
 
+
 @router.callback_query(F.data.startswith("ans_"))
 async def handle_answer(callback: CallbackQuery):
     try:
@@ -352,7 +508,7 @@ async def handle_answer(callback: CallbackQuery):
         log_event(chat_id, "user_answer", f"Вопрос {idx + 1}: {ans.upper()}")
 
         # небольшая пауза и сразу отправляем следующий вопрос
-        await asyncio.sleep(0.2)
+        await smart_sleep(chat_id, prod_seconds=0, test_seconds=0)  # фактически без задержки
         if idx + 1 < len(avoidance_questions):
             await send_question(chat_id, idx + 1)
             # скрываем старые кнопки чуть позже, чтобы переход был плавным
@@ -362,7 +518,7 @@ async def handle_answer(callback: CallbackQuery):
             except Exception:
                 pass
         else:
-            await asyncio.sleep(0.2)
+            await smart_sleep(chat_id, prod_seconds=0, test_seconds=0)
             await finish_test(chat_id)
             try:
                 await callback.message.edit_reply_markup(reply_markup=None)
@@ -391,6 +547,7 @@ def _cta_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
+
 @router.callback_query(F.data == "avoidance_ok")
 async def handle_avoidance_ok(callback: CallbackQuery):
     await callback.answer()
@@ -400,7 +557,6 @@ async def handle_avoidance_ok(callback: CallbackQuery):
         pass
     await bot.send_message(callback.message.chat.id, "Супер! У Вас всё получится! 💪🏼")
     log_event(callback.message.chat.id, "user_avoidance_response", "Ответил: Хорошо 😌")
-    await send_case_story(callback.message.chat.id)
 
 
 @router.callback_query(F.data == "avoidance_scared")
@@ -412,9 +568,6 @@ async def handle_avoidance_scared(callback: CallbackQuery):
         pass
     await bot.send_message(callback.message.chat.id, "Ничего, иногда нужно собраться с силами, чтобы решиться на то, что тревожно 🫶🏼")
     log_event(callback.message.chat.id, "user_avoidance_response", "Ответил: Нет, пока боюсь 🙈")
-    await send_case_story(callback.message.chat.id)
-
-
 
 
 async def finish_test(chat_id: int):
@@ -437,9 +590,11 @@ async def finish_test(chat_id: int):
         "⬇️\nТем больше переживаем по поводу них.\n\nИ так до бесконечности 🔄"
     )
 
+    # 6. "Тест завершён" — сразу
+    await bot.send_message(chat_id, "Тест завершён. Подождите секунду, обрабатываем результаты ⏳")
+    await smart_sleep(chat_id, prod_seconds=3, test_seconds=1)  # 7. "Судя по Вашим ответам" — через 3 секунды
+
     if yes_count >= 4:
-        await bot.send_message(chat_id, "Тест завершён. Подождите секунду, обрабатываем результаты ⏳")
-        await asyncio.sleep(1)
         part1 = (
             "Судя по Вашим ответам, Вам приходится довольно сильно подстраивать свою жизнь под "
             "<b><i>избегание</i></b> возможных повторных приступов паники. Это ловушка, в которую попадаются очень многие люди 🪤\n\n" + chain
@@ -450,7 +605,7 @@ async def finish_test(chat_id: int):
             "Кажется, будто без этих «страхующих» привычек станет невыносимо дискомфортно. "
             "Но каждый раз, когда мы не убегаем, а остаёмся в пугающей ситуации, мозг получает новый опыт — что <i>опасность была преувеличена</i>.\n\n"
             "Вы уже почитали в моём гайде о том, как правильно отвечать себе на пугающие <u>мысли</u>. "
-            "Поэтому теперь, держа под рукой эту памятку, Вы можете и в своих <u>действиях</u>" 
+            "Поэтому теперь, держа под рукой эту памятку, Вы можете и в своих <u>действиях</u>"
             "попробовать немного зайти за грань того, в чём ограничивает Вас тревога 🪂\n\n"
             "Я предлагаю следующее.\n\nВозьмите один из пунктов, на который Вы ответили «Да», и начните делать его наоборот.\n\n"
             "🔹 Привыкли всегда носить с собой бутылку воды? 👉🏼 Оставьте её дома!\n"
@@ -461,12 +616,11 @@ async def finish_test(chat_id: int):
             "Попробуете?"
         )
         await bot.send_message(chat_id, part1, parse_mode="HTML")
-        await asyncio.sleep(1)
+        # 8. "Хорошая новость..." — через минуту
+        await smart_sleep(chat_id, prod_seconds=60, test_seconds=3)
         await bot.send_message(chat_id, part2, parse_mode="HTML", reply_markup=_cta_keyboard())
 
     elif 2 <= yes_count <= 3:
-        await bot.send_message(chat_id, "Тест завершён. Подождите секунду, обрабатываем результаты ⏳")
-        await asyncio.sleep(3)
         part1 = (
             "Судя по Вашим ответам, Вам в некоторой степени приходится подстраивать свою жизнь под "
             "<b><i>избегание</i></b> возможных повторных приступов паники. Это ловушка, в которую попадаются очень многие люди 🪤\n\n" + chain
@@ -477,7 +631,7 @@ async def finish_test(chat_id: int):
             "Кажется, будто без этих «страхующих» привычек станет невыносимо дискомфортно. "
             "Но каждый раз, когда мы не убегаем, а остаёмся в пугающей ситуации, мозг получает новый опыт — что <i>опасность была преувеличена</i>.\n\n"
             "Вы уже почитали в моём гайде о том, как правильно отвечать себе на пугающие <u>мысли</u>. "
-            "Поэтому теперь, держа под рукой эту памятку, Вы можете и в своих <u>действиях</u>" 
+            "Поэтому теперь, держа под рукой эту памятку, Вы можете и в своих <u>действиях</u>"
             "попробовать немного зайти за грань того, в чём ограничивает Вас тревога 🪂\n\n"
             "Я предлагаю следующее.\n\nВозьмите один из пунктов, на который Вы ответили «Да», и начните делать его наоборот.\n\n"
             "🔹 Привыкли всегда носить с собой бутылку воды? 👉🏼 Оставьте её дома!\n"
@@ -487,12 +641,10 @@ async def finish_test(chat_id: int):
             "Попробуете?"
         )
         await bot.send_message(chat_id, part1, parse_mode="HTML")
-        await asyncio.sleep(1)
+        await smart_sleep(chat_id, prod_seconds=60, test_seconds=3)
         await bot.send_message(chat_id, part2, parse_mode="HTML", reply_markup=_cta_keyboard())
 
     elif yes_count == 1:
-        await bot.send_message(chat_id, "Тест завершён. Подождите секунду, обрабатываем результаты ⏳")
-        await asyncio.sleep(3)
         text = (
             "Судя по Вашим ответам, Вы практически не позволяете страху менять Ваш образ жизни. Это отлично!\n\n"
             "Потому что <b><i>избегание</i></b> часто загоняет в ловушку:\n" + chain + "\n\n"
@@ -508,8 +660,6 @@ async def finish_test(chat_id: int):
         await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_cta_keyboard())
 
     else:  # yes_count == 0
-        await bot.send_message(chat_id, "Тест завершён. Подождите секунду, обрабатываем результаты ⏳")
-        await asyncio.sleep(1)
         text = (
             "Судя по Вашим ответам, Вы не позволяете страху менять Ваш образ жизни. Это отлично!\n\n"
             "Если у Вас есть какие-то <b><i>избегания</i></b>, которые не попали в опросник, то теперь — держа под рукой памятку — "
@@ -522,12 +672,19 @@ async def finish_test(chat_id: int):
         )
         await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_cta_keyboard())
 
+    # 10. "Чтобы ослабить власть тревоги..." — через сутки после теста (для всех, независимо от ответов на кнопки)
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=24 * 60 * 60,
+        test_seconds=5,
+        kind="case_story"
+    )
+
 # =========================================================
 # 5. ДАЛЬНЕЙШИЕ ЭТАПЫ
 # =========================================================
 async def send_case_story(chat_id: int):
-    logger.info(f"→ Начато send_case_story для chat_id={chat_id}")  # ← добавили в самое начало
-    await asyncio.sleep(1)
+    logger.info(f"→ Начато send_case_story для chat_id={chat_id}")
     text = (
         "<b>Чтобы ослабить власть тревоги над нами, нам нужно начать делать то, что страшно.</b>\n\n"
         "Теперь я хочу показать Вам, как это выглядит на практике. \n\n"   
@@ -558,15 +715,23 @@ async def send_case_story(chat_id: int):
     upsert_user(chat_id, step="case_story")
     log_event(chat_id, "bot_case_story_sent", "Отправлена история пациента")
 
-    await asyncio.sleep(2)
-    logger.info(f"→ Запуск финального сообщения для chat_id={chat_id}")  # ← оставляем этот лог
-    await send_final_message(chat_id)
-
-
+    # 11. "С людьми, переживающими панические атаки..." — ещё через сутки после истории
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=24 * 60 * 60,
+        test_seconds=5,
+        kind="final_block1"
+    )
 
 
 async def send_final_message(chat_id: int):
-    await asyncio.sleep(1)
+    """
+    Финальный блок 1:
+    11. "С людьми, переживающими панические атаки..." — старт блока
+    12. "По итогам прохождения..." — через минуту
+    Затем планируем блок 2 через сутки.
+    """
+    await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
 
     photo = FSInputFile("media/DSC03503.jpg")
 
@@ -580,7 +745,7 @@ async def send_final_message(chat_id: int):
         "от списка необходимых обследований - до распорядка упражнений по преодолению страха.\n\n"
     )
 
-    # 1) отправляем фото с более короткой подписью
+    # 11) отправляем фото с подписью
     await bot.send_photo(
         chat_id,
         photo=photo,
@@ -588,7 +753,9 @@ async def send_final_message(chat_id: int):
         parse_mode="HTML"
     )
 
-    # 2) отдельным сообщением — длинный текст + кнопка
+    # 12) отдельным сообщением — длинный текст + кнопка, через минуту
+    await smart_sleep(chat_id, prod_seconds=60, test_seconds=3)
+
     text = (
         "По итогам прохождения психотерапии Вы получите:\n\n"
         "✨ снижение <b>гиперконтроля и проверок</b> собственного состояния: больше не нужно будет постоянно измерять пульс, "
@@ -617,8 +784,24 @@ async def send_final_message(chat_id: int):
         reply_markup=keyboard
     )
 
-    # 3) дополнительное сообщение спустя 5 секунд
-    await asyncio.sleep(1)
+    # Планируем блок 2 (13 + картинки) через сутки
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=24 * 60 * 60,
+        test_seconds=5,
+        kind="final_block2"
+    )
+
+
+async def send_final_block2(chat_id: int):
+    """
+    Блок 2:
+    13. "Одно из самых частых сомнений..." — через сутки после блока 1
+    14. две картинки — сразу после текста
+    Планируем блок 3 через сутки.
+    """
+    await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
+
     extra_text = (
         "<b>Одно из самых частых сомнений у тех, кто задумывается о психотерапии, — «А мне это точно поможет?»</b>\n\n"
         "Это абсолютно понятный вопрос, особенно если панические атаки длятся уже долго, а прошлые попытки справиться не дали ощутимого эффекта. "
@@ -633,20 +816,31 @@ async def send_final_message(chat_id: int):
     )
     await bot.send_message(chat_id, extra_text, parse_mode="HTML")
 
-    # 4) отправляем новые фотографии после текста
-    await asyncio.sleep(1)
+    # 14) отправляем две фотографии сразу после текста
+    await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
     extra_photo1 = FSInputFile("media/Scrc2798760b2b95377.jpg")
     await bot.send_photo(chat_id, photo=extra_photo1)
 
-    await asyncio.sleep(1)
+    await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
     extra_photo2 = FSInputFile("media/Scb2b95377.jpg")
     await bot.send_photo(chat_id, photo=extra_photo2)
 
-    upsert_user(chat_id, step="final_message_sent")
-    log_event(chat_id, "bot_final_message_sent", "Отправлено финальное сообщение с фото и текстом")
-    
-        # 5) отправляем заключительное сообщение о мыслях при панике
-    await asyncio.sleep(5)
+    # Планируем блок 3 через сутки
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=24 * 60 * 60,
+        test_seconds=5,
+        kind="final_block3"
+    )
+
+
+async def send_final_block3(chat_id: int):
+    """
+    Блок 3:
+    15. "Вам может казаться, что у Вас нет никаких мыслей..." — через сутки после блока 2.
+    """
+    await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
+
     thoughts_text = (
         "<b>Вам может казаться, что у Вас нет никаких мыслей во время панической атаки.</b>\n\n"
         "Может складываться впечатление, что страх просто наваливается сам по себе: "
@@ -679,22 +873,21 @@ async def send_final_message(chat_id: int):
         "Адреналин еще сохраняется в теле, но уже перестаёт затмевать разум."
     )
 
-    await bot.send_message(chat_id, thoughts_text, parse_mode="HTML")  
-    
-    
-    
+    await bot.send_message(chat_id, thoughts_text, parse_mode="HTML")
 
-
-
+    upsert_user(chat_id, step="final_message_sent")
+    log_event(chat_id, "bot_final_message_sent", "Отправлена завершающая серия сообщений")
 
 
 # =========================================================
 # 6. ЗАПУСК
 # =========================================================
 async def main():
-    logger.info("Бот запущен.")
-    await dp.start_polling(bot)
+    logger.info(f"Бот запущен. MODE={MODE}, TEST_USER_ID={TEST_USER_ID or '—'}")
+    await asyncio.gather(
+        dp.start_polling(bot),
+        scheduler_worker(),
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
-
