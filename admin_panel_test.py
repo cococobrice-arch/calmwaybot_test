@@ -176,6 +176,7 @@ async def panel_main():
             <td>{status}</td>
             <td>{consult}</td>
             <td>{last_action_fmt}</td>
+            <td><a href="/panel-database-test/user/{user_id}"><button>История</button></a></td>
         </tr>
         """
 
@@ -191,6 +192,7 @@ async def panel_main():
             <th>Подписан</th>
             <th>Интересовался консультацией</th>
             <th>Последнее действие</th>
+            <th></th>
         </tr>
         {rows_html}
     </table>
