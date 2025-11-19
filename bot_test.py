@@ -516,10 +516,11 @@ async def finish_test(chat_id: int):
     answered = cursor.fetchone()
     conn.close()
 
-    if answered:
-    schedule_message(chat_id, prod_seconds=60 * 60, test_seconds=5, kind="case_story")
-else:
-    schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=30, kind="case_story")
+        if answered:
+        schedule_message(chat_id, prod_seconds=60 * 60, test_seconds=5, kind="case_story")
+        else:
+        schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=30, kind="case_story")
+
 
 # =========================================================
 # 4. БЛОКИ ПОСЛЕ ТЕСТА
