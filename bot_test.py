@@ -147,21 +147,27 @@ def purge_user(user_id: int):
 
 def is_fast_user(user_id: int) -> bool:
     """
-    Быстрый режим задержек:
-    - если MODE == "test" → для всех
-    - или если user_id == TEST_USER_ID
+    Пользователь быстрый, если:
+    - MODE=test   (весь бот в ускоренном режиме)
+    - user_id == FAST_USER_ID (точечный быстрый пользователь)
     """
     if MODE == "test":
         return True
-    if TEST_USER_ID and user_id == TEST_USER_ID:
+
+    fast_user_raw = os.getenv("FAST_USER_ID")
+    FAST_USER_ID = int(fast_user_raw) if fast_user_raw and fast_user_raw.isdigit() else None
+
+    if FAST_USER_ID and user_id == FAST_USER_ID:
         return True
+
     return False
 
 
+
 async def smart_sleep(user_id: int, prod_seconds: int, test_seconds: int = 3):
-    """Асинхронный sleep, который сокращает задержку для тестовых пользователей/режима."""
     delay = test_seconds if is_fast_user(user_id) else prod_seconds
     await asyncio.sleep(delay)
+
 
 
 def schedule_message(user_id: int, prod_seconds: int, kind: str, payload: str = None, test_seconds: int = 3):
@@ -412,7 +418,7 @@ async def send_material(callback: CallbackQuery):
 
     # Материал
     if LINK and os.path.exists(LINK):
-        file = FSInputFile(LINK, filename="Выход из панического круга2.pdf")
+        file = FSInputFile(LINK, filename="Выход из панического круга.pdf")
         await bot.send_document(chat_id, document=file, caption="Вот Ваш первый шаг к спокойствию 🧘🏻‍♀️")
     elif LINK and LINK.startswith("http"):
         await bot.send_message(chat_id, f"📘 Ваш материал доступен по ссылке: {LINK}")
