@@ -144,18 +144,17 @@ def get_users():
     return rows
 
 
-def get_user_events(user_id: int):
+def has_consult_interest(user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT timestamp, action, details
-        FROM events
-        WHERE user_id=?
-        ORDER BY id ASC
+        SELECT 1 FROM events
+        WHERE user_id=? AND action='Открыта информация о консультациях'
+        LIMIT 1
     """, (user_id,))
-    rows = cursor.fetchall()
+    row = cursor.fetchone()
     conn.close()
-    return rows
+    return bool(row)
 
 
 @app.get("/panel-database-test", response_class=HTMLResponse)
@@ -165,6 +164,7 @@ async def panel_main():
     rows_html = ""
     for user_id, source, step, subscribed, last_action, username in users:
         status = "✅" if subscribed else "—"
+        consult = "✅" if has_consult_interest(user_id) else "—"
         display_name = f"@{username}" if username else str(user_id)
         last_action_fmt = fmt_time(last_action)
 
@@ -174,8 +174,8 @@ async def panel_main():
             <td>{source}</td>
             <td>{step}</td>
             <td>{status}</td>
+            <td>{consult}</td>
             <td>{last_action_fmt}</td>
-            <td><a href="/panel-database-test/user/{user_id}"><button>История</button></a></td>
         </tr>
         """
 
@@ -189,8 +189,8 @@ async def panel_main():
             <th>Источник</th>
             <th>Этап</th>
             <th>Подписан</th>
+            <th>Интересовался консультацией</th>
             <th>Последнее действие</th>
-            <th></th>
         </tr>
         {rows_html}
     </table>
@@ -205,7 +205,16 @@ async def panel_main():
 
 @app.get("/panel-database-test/user/{user_id}", response_class=HTMLResponse)
 async def user_history(user_id: int):
-    events = get_user_events(user_id)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT timestamp, action, details
+        FROM events
+        WHERE user_id=?
+        ORDER BY id ASC
+    """, (user_id,))
+    events = cursor.fetchall()
+    conn.close()
 
     if not events:
         rows = "<tr><td colspan='3'>Нет записей</td></tr>"
