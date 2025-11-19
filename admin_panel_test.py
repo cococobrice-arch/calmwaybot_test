@@ -4,16 +4,15 @@ from datetime import datetime
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-# -------------------- Конфигурация --------------------
+
 DB_PATH = "/home/dmitry/calmwaybot_test/users_test.db"
 
 app = FastAPI(title="CalmWayBot TEST Admin Panel")
 
-# -------------------- Стили --------------------
+
 STYLE = """
 <style>
 
-/* Цветовые переменные по умолчанию (light theme) */
 :root {
     --bg: #ffffff;
     --fg: #000000;
@@ -24,7 +23,6 @@ STYLE = """
     --accent-hover: #005fa3;
 }
 
-/* Темная тема */
 @media (prefers-color-scheme: dark) {
     :root {
         --bg: #0d1117;
@@ -95,9 +93,7 @@ a {
 </style>
 """
 
-# =========================================================
-# Инициализация БД
-# =========================================================
+
 def ensure_schema():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -126,17 +122,18 @@ def ensure_schema():
     conn.commit()
     conn.close()
 
+
 ensure_schema()
 
-# =========================================================
-# Хелперы
-# =========================================================
 
 def fmt_time(ts: str) -> str:
+    if not ts:
+        return "-"
     try:
         return datetime.fromisoformat(ts).strftime("%Y-%m-%d – %H:%M")
-    except Exception:
+    except:
         return ts
+
 
 def get_users():
     conn = sqlite3.connect(DB_PATH)
@@ -146,21 +143,21 @@ def get_users():
     conn.close()
     return rows
 
+
 def get_user_events(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT timestamp, action, details FROM events WHERE user_id=? ORDER BY id ASC",
-        (user_id,)
-    )
+    cursor.execute("""
+        SELECT timestamp, action, details
+        FROM events
+        WHERE user_id=?
+        ORDER BY id ASC
+    """, (user_id,))
     rows = cursor.fetchall()
     conn.close()
     return rows
 
 
-# =========================================================
-# Главная панель
-# =========================================================
 @app.get("/panel-database-test", response_class=HTMLResponse)
 async def panel_main():
     users = get_users()
@@ -169,7 +166,7 @@ async def panel_main():
     for user_id, source, step, subscribed, last_action, username in users:
         status = "✅" if subscribed else "—"
         display_name = f"@{username}" if username else str(user_id)
-        last_action_fmt = fmt_time(str(last_action)) if last_action else "-"
+        last_action_fmt = fmt_time(last_action)
 
         rows_html += f"""
         <tr>
@@ -184,7 +181,7 @@ async def panel_main():
 
     html = f"""
     {STYLE}
-    <h1>CalmWayBot TEST — Users Database</h1>
+    <h1>CalmWayBot TEST — Users</h1>
 
     <table>
         <tr>
@@ -206,29 +203,29 @@ async def panel_main():
     return html
 
 
-# =========================================================
-# История пользователя
-# =========================================================
 @app.get("/panel-database-test/user/{user_id}", response_class=HTMLResponse)
 async def user_history(user_id: int):
     events = get_user_events(user_id)
 
-    rows = (
-        "<tr><td colspan='3'>Нет записей действий пользователя</td></tr>"
-        if not events else
-        "".join(
+    if not events:
+        rows = "<tr><td colspan='3'>Нет записей</td></tr>"
+    else:
+        rows = "".join(
             f"<tr><td>{fmt_time(ts)}</td><td>{action}</td><td>{details or '-'}</td></tr>"
             for ts, action, details in events
         )
-    )
 
     html = f"""
     {STYLE}
-    <h1>История пользователя {user_id} (TEST)</h1>
+    <h1>История действий — {user_id}</h1>
     <a href="/panel-database-test">⬅ Назад</a>
 
     <table>
-        <tr><th>Время</th><th>Действие</th><th>Детали</th></tr>
+        <tr>
+            <th>Время</th>
+            <th>Действие</th>
+            <th>Детали</th>
+        </tr>
         {rows}
     </table>
     """
@@ -236,9 +233,6 @@ async def user_history(user_id: int):
     return html
 
 
-# =========================================================
-# Запуск
-# =========================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("admin_panel_test:app", host="0.0.0.0", port=8081)
