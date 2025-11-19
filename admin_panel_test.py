@@ -138,30 +138,12 @@ def fmt_time(ts: str) -> str:
 def get_users():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT 
-            u.user_id, 
-            u.source, 
-            u.step, 
-            u.subscribed, 
-            u.last_action, 
-            u.username,
-            CASE 
-                WHEN EXISTS (
-                    SELECT 1 FROM events e 
-                    WHERE e.user_id = u.user_id 
-                    AND e.action='Открыта информация о консультациях'
-                )
-                THEN 1 ELSE 0
-            END AS consult_clicked
-        FROM users u
-        ORDER BY u.last_action DESC
-    """)
-
+    cursor.execute("SELECT user_id, source, step, subscribed, last_action, username FROM users ORDER BY last_action DESC")
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+
 def get_user_events(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -181,9 +163,8 @@ async def panel_main():
     users = get_users()
 
     rows_html = ""
-    for user_id, source, step, subscribed, last_action, username, consult_clicked in users:
+    for user_id, source, step, subscribed, last_action, username in users:
         status = "✅" if subscribed else "—"
-        consult_status = "✔️" if consult_clicked else "—"
         display_name = f"@{username}" if username else str(user_id)
         last_action_fmt = fmt_time(last_action)
 
@@ -193,8 +174,8 @@ async def panel_main():
             <td>{source}</td>
             <td>{step}</td>
             <td>{status}</td>
-            <td>{consult_status}</td>
             <td>{last_action_fmt}</td>
+            <td><a href="/panel-database-test/user/{user_id}"><button>История</button></a></td>
         </tr>
         """
 
@@ -208,8 +189,8 @@ async def panel_main():
             <th>Источник</th>
             <th>Этап</th>
             <th>Подписан</th>
-            <th>Консультации</th>
             <th>Последнее действие</th>
+            <th></th>
         </tr>
         {rows_html}
     </table>
