@@ -129,7 +129,7 @@ def upsert_user(user_id: int, step: str | None = None, subscribed: int | None = 
     else:
         cursor.execute(
             "INSERT INTO users (user_id, source, step, subscribed, last_action, username) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, "unknown", step or "start", subscribed or 0, now, username),
+            (user_id, "unknown", step or "старт", subscribed or 0, now, username),
         )
 
     conn.commit()
@@ -181,7 +181,11 @@ def schedule_message(
     conn.commit()
     conn.close()
 
-    log_event(user_id, "scheduled_message_created", f"{kind} @ {send_at}")
+    log_event(
+        user_id,
+        "Запланировано отложенное сообщение",
+        f"Тип: {kind}, время отправки: {send_at.isoformat(timespec='seconds')}"
+    )
 
 
 def mark_message_delivered(task_id: int):
@@ -193,6 +197,7 @@ def mark_message_delivered(task_id: int):
 
 
 async def process_scheduled_message(task_id: int, user_id: int, kind: str, payload: str | None):
+    log_event(user_id, "Запущено отложенное сообщение", f"Тип: {kind}")
     try:
         if kind == "channel_invite":
             await send_channel_invite(user_id)
@@ -206,8 +211,10 @@ async def process_scheduled_message(task_id: int, user_id: int, kind: str, paylo
             await send_final_block2(user_id)
         elif kind == "final_block3":
             await send_final_block3(user_id)
+        elif kind == "chat_invite":
+            await send_chat_invite(user_id)
         else:
-            log_event(user_id, "scheduled_message_unknown", kind)
+            log_event(user_id, "Неизвестный тип отложенного сообщения", kind)
     finally:
         mark_message_delivered(task_id)
 
@@ -258,10 +265,10 @@ async def cmd_start(message: Message):
 
     if user_id == TEST_USER_ID:
         purge_user(user_id)
-        log_event(user_id, "purge_on_start", "Тестовый пользователь — данные очищены")
+        log_event(user_id, "Очистка данных тестового пользователя", "Данные тестового пользователя очищены при старте")
 
-    upsert_user(user_id, step="start", username=username)
-    log_event(user_id, "user_start", "Пользователь запустил бота")
+    upsert_user(user_id, step="старт", username=username)
+    log_event(user_id, "Запуск бота", "Команда /start")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -299,8 +306,8 @@ async def send_material(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     username = callback.from_user.username or None
 
-    upsert_user(chat_id, step="got_material", username=username)
-    log_event(chat_id, "user_clicked_get_material", "Нажал «Получить гайд»")
+    upsert_user(chat_id, step="получил_гайд", username=username)
+    log_event(chat_id, "Нажата кнопка «Получить гайд»", "Начало выдачи материала")
 
     if VIDEO_NOTE_FILE_ID:
         try:
@@ -308,14 +315,18 @@ async def send_material(callback: CallbackQuery):
             await bot.send_video_note(chat_id, VIDEO_NOTE_FILE_ID)
         except Exception as e:
             logger.warning(f"Ошибка отправки кружка: {e}")
+            log_event(chat_id, "Ошибка отправки приветственного видео", str(e))
 
     if LINK and os.path.exists(LINK):
         file = FSInputFile(LINK, filename="Выход из панического круга.pdf")
         await bot.send_document(chat_id, document=file, caption="Вот Ваш первый шаг к спокойствию 🧘🏻‍♀️")
+        log_event(chat_id, "Отправлен файл с гайдом", "Гайд отправлен как документ")
     elif LINK and LINK.startswith("http"):
         await bot.send_message(chat_id, f"📘 Ваш материал доступен по ссылке: {LINK}")
+        log_event(chat_id, "Отправлена ссылка на гайд", LINK)
     else:
         await bot.send_message(chat_id, "⚠️ Файл не найден.")
+        log_event(chat_id, "Не удалось найти файл гайда", LINK or "Путь не задан")
 
     schedule_message(chat_id, prod_seconds=20 * 60, test_seconds=5, kind="channel_invite")
     schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=5, kind="avoidance_intro")
@@ -324,7 +335,7 @@ async def send_material(callback: CallbackQuery):
 
 
 async def send_channel_invite(chat_id: int):
-    upsert_user(chat_id, step="channel_invite_sent")
+    upsert_user(chat_id, step="приглашение_в_канал")
 
     text = (
         "У меня есть телеграм-канал, где я делюсь нюансами об эффективных способах преодоления тревоги "
@@ -352,9 +363,11 @@ async def send_channel_invite(chat_id: int):
             disable_web_page_preview=True,
             reply_markup=kb,
         )
-        log_event(chat_id, "channel_invite_sent", "Приглашение отправлено")
-    except Exception:
-        log_event(chat_id, "channel_invite_failed", "Ошибка отправки приглашения")
+        log_event(chat_id, "Отправлено приглашение в канал", None)
+    except Exception as e:
+        log_event(chat_id, "Ошибка отправки приглашения в канал", str(e))
+
+
 # =========================================================
 # 3. ОПРОС ИЗБЕГАНИЯ
 # =========================================================
@@ -372,7 +385,7 @@ avoidance_questions = [
 
 
 async def send_avoidance_intro(chat_id: int):
-    upsert_user(chat_id, step="avoidance_intro_sent")
+    upsert_user(chat_id, step="предложен_тест_избегания")
     text = (
         "Вам может казаться, что панические атаки продолжают возникать, несмотя на то что Вы стараетесь их не провоцировать.\n"
         "Давайте проверим, насколько ваши привычки действительно помогают, а где — мешают?\n\n"
@@ -382,7 +395,7 @@ async def send_avoidance_intro(chat_id: int):
         inline_keyboard=[[InlineKeyboardButton(text="Начать тест", callback_data="avoidance_start")]]
     )
     await bot.send_message(chat_id, text, reply_markup=kb)
-    log_event(chat_id, "user_clicked_avoidance_intro", "Предложен опрос избегания")
+    log_event(chat_id, "Показан блок с предложением теста", "Предложен опрос избегания")
 
 
 @router.callback_query(F.data == "avoidance_start")
@@ -396,8 +409,8 @@ async def start_avoidance_test(callback: CallbackQuery):
     conn.commit()
     conn.close()
 
-    upsert_user(chat_id, step="avoidance_test")
-    log_event(chat_id, "user_clicked_avoidance_start", "Начал опрос избегания")
+    upsert_user(chat_id, step="тест_избегания_начат")
+    log_event(chat_id, "Начат тест избегания", "Нажата кнопка «Начать тест»")
 
     await bot.send_message(chat_id, "Итак, начнём:")
     await send_question(chat_id, 0)
@@ -439,6 +452,12 @@ async def handle_answer(callback: CallbackQuery):
         conn.commit()
         conn.close()
 
+        log_event(
+            chat_id,
+            "Ответ на вопрос теста избегания",
+            f"Вопрос {idx + 1}, ответ: {'Да' if ans == 'yes' else 'Нет'}"
+        )
+
         if idx + 1 < len(avoidance_questions):
             await send_question(chat_id, idx + 1)
         else:
@@ -455,6 +474,7 @@ async def handle_answer(callback: CallbackQuery):
             await bot.send_message(chat_id, "Ошибка обработки ответа. Попробуйте ещё раз.")
         except Exception:
             pass
+        log_event(chat_id, "Ошибка обработки ответа теста избегания", str(e))
 
 
 # =========================================================
@@ -469,8 +489,8 @@ async def finish_test(chat_id: int):
     conn.close()
 
     yes_count = answers.count("yes")
-    upsert_user(chat_id, step="avoidance_done")
-    log_event(chat_id, "user_finished_test", f"Ответов 'ДА': {yes_count}")
+    upsert_user(chat_id, step="тест_избегания_завершен")
+    log_event(chat_id, "Тест избегания завершен", f"Количество ответов «Да»: {yes_count}")
 
     chain = (
         "Чем больше вынужденных ограничений мы накладываем на свою жизнь\n"
@@ -546,7 +566,7 @@ async def finish_test(chat_id: int):
             "🔹 Привыкли всегда носить с собой бутылку воды? 👉🏼 Оставьте её дома!\n"
             "🔹 Держите окно приоткрытым? 👉🏼 Постарайтесь подольше побыть в небольшом дефиците кислорода.\nИ т.п.\n\n"
             "Но не всё сразу! Возьмите для изменения сначала только одно правило и поработайте пару недель над отказом от него.\n\n"
-            "Это будет дискомфортно, но я обещаю: это даст Вам больше уверенности в Вашей способности справляться со страхом 🦁\n\n"
+            "Это будет дискомфортно, но я обещаю: это даст Вам больше уверенности в своей способности справляться со страхом 🦁\n\n"
             "Попробуете?"
         )
         msg = await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_cta_keyboard())
@@ -560,7 +580,7 @@ async def finish_test(chat_id: int):
             "Примеры:\n"
             "🔹 Стараетесь не вспоминать про паническую атаку? 👉🏼 Повспоминайте про неё специально.\n\n"
             "🔹 Избегаете места первого приступа? 👉🏼 Посетите его ещё раз.\n\n\n"
-            "Это будет дискомфортно, но я обещаю: это даст Вам больше уверенности в Вашей способности справляться со страхом 🦁\n\n"
+            "Это будет дискомфортно, но я обещаю: это даст Вам больше уверенности в своей способности справляться со страхом 🦁\n\n"
             "Попробуете?"
         )
         msg = await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_cta_keyboard())
@@ -574,6 +594,8 @@ async def finish_test(chat_id: int):
             kind="case_story",
             payload=str(final_msg_id),
         )
+
+
 # =========================================================
 # 4. БЛОКИ ПОСЛЕ ТЕСТА
 # =========================================================
@@ -599,7 +621,7 @@ async def handle_avoidance_ok(callback: CallbackQuery):
         pass
 
     await bot.send_message(chat_id, "Супер! У Вас всё получится! 💪🏼")
-    log_event(chat_id, "user_avoidance_response", "Ответил: Хорошо 😌")
+    log_event(chat_id, "Ответ на блок с предложением экспозиции", "Ответ: «Хорошо 😌»")
 
     schedule_message(
         user_id=chat_id,
@@ -620,7 +642,7 @@ async def handle_avoidance_scared(callback: CallbackQuery):
         pass
 
     await bot.send_message(chat_id, "Ничего, иногда нужно собраться с силами, чтобы решиться на то, что тревожно 🫶🏼")
-    log_event(chat_id, "user_avoidance_response", "Ответил: Нет, пока боюсь 🙈")
+    log_event(chat_id, "Ответ на блок с предложением экспозиции", "Ответ: «Нет, пока боюсь 🙈»")
 
     schedule_message(
         user_id=chat_id,
@@ -632,7 +654,7 @@ async def handle_avoidance_scared(callback: CallbackQuery):
 
 
 async def send_case_story(chat_id: int, payload: str | None = None):
-    upsert_user(chat_id, step="case_story")
+    upsert_user(chat_id, step="история_пациентки")
 
     if payload:
         try:
@@ -672,15 +694,15 @@ async def send_case_story(chat_id: int, payload: str | None = None):
 
     try:
         await bot.send_message(chat_id, text, parse_mode="HTML")
-        log_event(chat_id, "message_case_story", "История пациента")
-    except Exception:
-        log_event(chat_id, "message_failed", "История пациента — недоставлено")
+        log_event(chat_id, "Отправлена история пациентки", None)
+    except Exception as e:
+        log_event(chat_id, "Ошибка отправки истории пациентки", str(e))
 
     schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=5, kind="final_block1")
 
 
 async def send_final_message(chat_id: int):
-    upsert_user(chat_id, step="final_block1_sent")
+    upsert_user(chat_id, step="приглашение_на_консультацию")
     await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
 
     photo = FSInputFile("media/DSC03503.jpg")
@@ -697,9 +719,9 @@ async def send_final_message(chat_id: int):
 
     try:
         await bot.send_photo(chat_id, photo=photo, caption=caption, parse_mode="HTML")
-        log_event(chat_id, "message_final_block1", "С людьми, переживающими панические атаки…")
-    except Exception:
-        log_event(chat_id, "message_failed", "Ошибка блока 1")
+        log_event(chat_id, "Отправлено сообщение с приглашением на консультацию (фото)", None)
+    except Exception as e:
+        log_event(chat_id, "Ошибка отправки блока «приглашение на консультацию» (фото)", str(e))
 
     await smart_sleep(chat_id, prod_seconds=60, test_seconds=3)
 
@@ -724,9 +746,9 @@ async def send_final_message(chat_id: int):
 
     try:
         await bot.send_message(chat_id, text2, parse_mode="HTML", reply_markup=kb)
-        log_event(chat_id, "message_final_block1_second", "По итогам психотерапии…")
-    except Exception:
-        log_event(chat_id, "message_failed", "Ошибка блока 2")
+        log_event(chat_id, "Отправлено текстовое приглашение на консультацию", None)
+    except Exception as e:
+        log_event(chat_id, "Ошибка отправки текстового блока «приглашение на консультацию»", str(e))
 
     schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=5, kind="final_block2")
 
@@ -736,8 +758,8 @@ async def consult_show(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     await callback.answer()
 
-    upsert_user(chat_id, step="consult_clicked")
-    log_event(chat_id, "user_clicked_consult", "Нажал «Узнать про консультации»")
+    upsert_user(chat_id, step="перешел_к_описанию_консультаций")
+    log_event(chat_id, "Открыта информация о консультациях", "Нажата кнопка «Узнать про консультации»")
 
     text = (
         "Прочитать про консультации можно здесь:\n"
@@ -746,12 +768,12 @@ async def consult_show(callback: CallbackQuery):
 
     try:
         await bot.send_message(chat_id, text, disable_web_page_preview=True)
-    except Exception:
-        pass
+    except Exception as e:
+        log_event(chat_id, "Ошибка отправки ссылки на консультации", str(e))
 
 
 async def send_final_block2(chat_id: int):
-    upsert_user(chat_id, step="final_block2_sent")
+    upsert_user(chat_id, step="сомнение_в_психотерапии")
     await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
 
     extra_text = (
@@ -769,21 +791,23 @@ async def send_final_block2(chat_id: int):
 
     try:
         await bot.send_message(chat_id, extra_text, parse_mode="HTML")
-        log_event(chat_id, "message_final_block2", "Одно из самых частых сомнений…")
-    except Exception:
-        log_event(chat_id, "message_failed", "Ошибка блока 3")
+        log_event(chat_id, "Отправлен блок про сомнения в психотерапии", None)
+    except Exception as e:
+        log_event(chat_id, "Ошибка отправки блока про сомнения в психотерапии", str(e))
 
     await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
-    await bot.send_photo(chat_id, FSInputFile("media/Scrc2798760b2b95377.jpg"))
-
-    await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
-    await bot.send_photo(chat_id, FSInputFile("media/Scb2b95377.jpg"))
+    try:
+        await bot.send_photo(chat_id, FSInputFile("media/Scrc2798760b2b95377.jpg"))
+        await bot.send_photo(chat_id, FSInputFile("media/Scb2b95377.jpg"))
+        log_event(chat_id, "Отправлены отзывы в блоке про сомнения", None)
+    except Exception as e:
+        log_event(chat_id, "Ошибка отправки отзывов в блоке про сомнения", str(e))
 
     schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=5, kind="final_block3")
 
 
 async def send_final_block3(chat_id: int):
-    upsert_user(chat_id, step="final_message_sent")
+    upsert_user(chat_id, step="ошибки_пациента_с_паническими_атаками")
     await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
 
     thoughts_text = (
@@ -812,9 +836,42 @@ async def send_final_block3(chat_id: int):
 
     try:
         await bot.send_message(chat_id, thoughts_text, parse_mode="HTML")
-        log_event(chat_id, "message_final_block3", "Вам может казаться…")
-    except Exception:
-        log_event(chat_id, "message_failed", "Ошибка блока 4")
+        log_event(chat_id, "Отправлен блок про ошибки пациента с паническими атаками", None)
+    except Exception as e:
+        log_event(chat_id, "Ошибка отправки блока про ошибки пациента", str(e))
+
+    # Новый финальный блок — приглашение в чат: через сутки (5 секунд для тестового)
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=24 * 60 * 60,
+        test_seconds=5,
+        kind="chat_invite",
+    )
+
+
+async def send_chat_invite(chat_id: int):
+    upsert_user(chat_id, step="приглашение_в_чат")
+
+    text = (
+        "Если у Вас есть какие-либо вопросы, касающиеся:\n"
+        "- Ваших симптомов\n"
+        "- диагноза\n"
+        "- методов лечения\n"
+        "то Вы можете задать их в моём публичном чате.\n"
+        "Там можно получить ответы от меня и поддержку от других участников."
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Вступить в чат", url="https://t.me/Ocd_and_Anxiety_Chat")]
+        ]
+    )
+
+    try:
+        await bot.send_message(chat_id, text, reply_markup=kb)
+        log_event(chat_id, "Отправлено приглашение в чат", None)
+    except Exception as e:
+        log_event(chat_id, "Ошибка отправки приглашения в чат", str(e))
 
 
 # =========================================================
