@@ -196,6 +196,9 @@ def schedule_message(user_id: int, prod_seconds: int, kind: str, payload: str = 
     conn.commit()
     conn.close()
 
+    log_event(user_id, "scheduled_message_created", f"{kind} @ {send_at_str}")
+
+
 def mark_message_delivered(task_id: int):
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
@@ -217,11 +220,17 @@ async def send_channel_invite(chat_id: int):
         member = await bot.get_chat_member(CHANNEL_USERNAME, chat_id)
         status = getattr(member, "status", None)
         is_subscribed = status in {"member", "administrator", "creator"}
-        upsert_user(chat_id, subscribed=1 if is_subscribed else 0)    except TelegramBadRequest as e:
+        upsert_user(chat_id, subscribed=1 if is_subscribed else 0)
+        log_event(chat_id, "bot_subscription_checked", f"Подписан: {is_subscribed}")
+    except TelegramBadRequest as e:
         logger.warning(f"Не удалось проверить подписку: {e} (считаем подписанным, приглашение не шлём)")
-        is_subscribed = True    except Exception as e:
+        is_subscribed = True
+        log_event(chat_id, "bot_subscription_checked", "Ошибка проверки, считаем подписанным")
+    except Exception as e:
         logger.warning(f"Сбой проверки подписки: {e} (считаем подписанным, приглашение не шлём)")
         is_subscribed = True
+        log_event(chat_id, "bot_subscription_checked", "Ошибка проверки (Exception) — считаем подписанным")
+
     if is_subscribed:
         # Уже подписан — просто выходим
         return
@@ -249,7 +258,8 @@ async def send_channel_invite(chat_id: int):
             parse_mode="HTML",
             reply_markup=keyboard,
             disable_web_page_preview=True
-        )        log_event(chat_id, "user_cta_clicked", "telegram_channel")
+        )
+        log_event(chat_id, "bot_channel_invite_sent", "Отправлено приглашение подписаться на канал")
     except Exception as e:
         logger.warning(f"Ошибка отправки приглашения на канал: {e}")
 
@@ -283,7 +293,9 @@ async def process_scheduled_message(task_id: int, user_id: int, kind: str, paylo
         elif kind == "final_block3":
             await send_final_block3(user_id)
         else:
-            logger.warning(f"Неизвестный тип отложенного сообщения: {kind} для user_id={user_id}")    finally:
+            logger.warning(f"Неизвестный тип отложенного сообщения: {kind} для user_id={user_id}")
+            log_event(user_id, "scheduled_message_unknown_kind", kind)
+    finally:
         # В любом случае помечаем задачу как обработанную, чтобы не зациклиться
         mark_message_delivered(task_id)
 
@@ -368,7 +380,7 @@ async def cmd_start(message: Message):
 
     await message.answer(
         """Если Вы зашли в этот бот, значит, Ваши тревоги уже успели сильно вмешаться в жизнь.\n 
-• Частое сердцебиение 💓 \n• Потемнение в глазах 🌘 \n• головокружение🌀 \n• пот по спине😰 \n• страх потерять рассудок...\n
+• Частое сердцебиение 💓 \n• потемнение в глазах 🌘 \n• головокружение🌀 \n• пот по спине😰 \n• страх потерять рассудок...\n
 Вы стараетесь взять себя в руки, но чем сильнее пытаетесь успокоиться — тем страшнее становится. 
 Анализы крови, обследования сердца и сосудов показывают, что всё в норме. Но наплывы ужаса продолжают догонять Вас.\n\n
 Знакомо? 
@@ -457,6 +469,8 @@ async def send_avoidance_intro(chat_id: int):
         inline_keyboard=[[InlineKeyboardButton(text="Начать тест", callback_data="avoidance_start")]]
     )
     await bot.send_message(chat_id, text, reply_markup=kb)
+    log_event(chat_id, "bot_avoidance_invite_sent", "Предложен опрос избегания")
+
 
 @router.callback_query(F.data == "avoidance_start")
 async def start_avoidance_test(callback: CallbackQuery):
@@ -521,7 +535,7 @@ async def handle_answer(callback: CallbackQuery):
         conn.commit()
         conn.close()
 
-        #  # отключено для приватности
+        log_event(chat_id, "user_answer", f"Вопрос {idx + 1}: {ans.upper()}")
 
         # небольшая пауза и сразу отправляем следующий вопрос
         await smart_sleep(chat_id, prod_seconds=0, test_seconds=0)  # фактически без задержки
@@ -729,6 +743,8 @@ async def send_case_story(chat_id: int):
     )
     await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
     upsert_user(chat_id, step="case_story")
+    log_event(chat_id, "bot_case_story_sent", "Отправлена история пациента")
+
     # 11. "С людьми, переживающими панические атаки..." — ещё через сутки после истории
     schedule_message(
         user_id=chat_id,
@@ -787,8 +803,7 @@ async def send_final_message(chat_id: int):
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Узнать про консультации", url="https://лечение-паники.рф/консультации")
-        log_event(chat_id, "user_cta_clicked", "consultation_link")]
+            [InlineKeyboardButton(text="Узнать про консультации", url="https://лечение-паники.рф/консультации")]
         ]
     )
 
@@ -891,6 +906,8 @@ async def send_final_block3(chat_id: int):
     await bot.send_message(chat_id, thoughts_text, parse_mode="HTML")
 
     upsert_user(chat_id, step="final_message_sent")
+    log_event(chat_id, "bot_final_message_sent", "Отправлена завершающая серия сообщений")
+
 
 # =========================================================
 # 6. ЗАПУСК
