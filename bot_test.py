@@ -137,7 +137,7 @@ def upsert_user(user_id: int, step: str | None = None, subscribed: int | None = 
 
 
 def purge_user(user_id: int):
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM events WHERE user_id=?", (user_id,))
     cursor.execute("DELETE FROM answers WHERE user_id=?", (user_id,))
@@ -324,6 +324,8 @@ async def send_material(callback: CallbackQuery):
 
 
 async def send_channel_invite(chat_id: int):
+    upsert_user(chat_id, step="channel_invite_sent")
+
     text = (
         "У меня есть телеграм-канал, где я делюсь нюансами об эффективных способах преодоления тревоги "
         "и развеиваю мифы о <i>не</i>работающих методах. "
@@ -456,11 +458,10 @@ async def handle_answer(callback: CallbackQuery):
 
 
 # =========================================================
-# 3.1 — ФИНИШ ТЕСТА (ВОССТАНОВЛЕННЫЙ ТВОЙ БЛОК)
+# 3.1 — ФИНИШ ТЕСТА
 # =========================================================
 
 async def finish_test(chat_id: int):
-    # собираем ответы
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
     cursor.execute("SELECT answer FROM answers WHERE user_id=?", (chat_id,))
@@ -482,7 +483,8 @@ async def finish_test(chat_id: int):
     await bot.send_message(chat_id, "Тест завершён. Подождите секунду, обрабатываем результаты ⏳")
     await smart_sleep(chat_id, prod_seconds=3, test_seconds=1)
 
-    # 4 и более
+    final_msg_id: int | None = None
+
     if yes_count >= 4:
         part1 = (
             "Судя по Вашим ответам, Вам приходится довольно сильно подстраивать свою жизнь под "
@@ -506,9 +508,9 @@ async def finish_test(chat_id: int):
         )
         await bot.send_message(chat_id, part1, parse_mode="HTML")
         await smart_sleep(chat_id, prod_seconds=60, test_seconds=3)
-        await bot.send_message(chat_id, part2, parse_mode="HTML", reply_markup=_cta_keyboard())
+        msg = await bot.send_message(chat_id, part2, parse_mode="HTML", reply_markup=_cta_keyboard())
+        final_msg_id = msg.message_id
 
-    # 2–3
     elif 2 <= yes_count <= 3:
         part1 = (
             "Судя по Вашим ответам, Вам в некоторой степени приходится подстраивать свою жизнь под "
@@ -531,9 +533,9 @@ async def finish_test(chat_id: int):
         )
         await bot.send_message(chat_id, part1, parse_mode="HTML")
         await smart_sleep(chat_id, prod_seconds=60, test_seconds=3)
-        await bot.send_message(chat_id, part2, parse_mode="HTML", reply_markup=_cta_keyboard())
+        msg = await bot.send_message(chat_id, part2, parse_mode="HTML", reply_markup=_cta_keyboard())
+        final_msg_id = msg.message_id
 
-    # 1
     elif yes_count == 1:
         text = (
             "Судя по Вашим ответам, Вы практически не позволяете страху менять Ваш образ жизни. Это отлично!\n\n"
@@ -547,9 +549,9 @@ async def finish_test(chat_id: int):
             "Это будет дискомфортно, но я обещаю: это даст Вам больше уверенности в Вашей способности справляться со страхом 🦁\n\n"
             "Попробуете?"
         )
-        await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_cta_keyboard())
+        msg = await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_cta_keyboard())
+        final_msg_id = msg.message_id
 
-    # 0
     else:
         text = (
             "Судя по Вашим ответам, Вы не позволяете страху менять Ваш образ жизни. Это отлично!\n\n"
@@ -561,15 +563,17 @@ async def finish_test(chat_id: int):
             "Это будет дискомфортно, но я обещаю: это даст Вам больше уверенности в Вашей способности справляться со страхом 🦁\n\n"
             "Попробуете?"
         )
-        await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_cta_keyboard())
+        msg = await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_cta_keyboard())
+        final_msg_id = msg.message_id
 
-    # Кейс-стори — корректно запланированный
-    schedule_message(
-        user_id=chat_id,
-        prod_seconds=24 * 60 * 60,
-        test_seconds=5,
-        kind="case_story"
-    )
+    if final_msg_id is not None:
+        schedule_message(
+            user_id=chat_id,
+            prod_seconds=24 * 60 * 60,
+            test_seconds=5,
+            kind="case_story",
+            payload=str(final_msg_id),
+        )
 # =========================================================
 # 4. БЛОКИ ПОСЛЕ ТЕСТА
 # =========================================================
@@ -731,6 +735,9 @@ async def send_final_message(chat_id: int):
 async def consult_show(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     await callback.answer()
+
+    upsert_user(chat_id, step="consult_clicked")
+    log_event(chat_id, "user_clicked_consult", "Нажал «Узнать про консультации»")
 
     text = (
         "Прочитать про консультации можно здесь:\n"
