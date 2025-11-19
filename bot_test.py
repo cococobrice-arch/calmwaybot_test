@@ -507,6 +507,7 @@ async def finish_test(chat_id: int):
 
     msg = await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_cta_keyboard())
 
+    # Проверяем, ответил ли пользователь на финальный вопрос (Хорошо / Боюсь)
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
     cursor.execute(
@@ -516,10 +517,21 @@ async def finish_test(chat_id: int):
     answered = cursor.fetchone()
     conn.close()
 
-        if answered:
-        schedule_message(chat_id, prod_seconds=60 * 60, test_seconds=5, kind="case_story")
-        else:
-        schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=30, kind="case_story")
+    # Планируем следующий шаг
+    if answered:
+        schedule_message(
+            user_id=chat_id,
+            prod_seconds=60 * 60,      # 1 час
+            test_seconds=5,
+            kind="case_story"
+        )
+    else:
+        schedule_message(
+            user_id=chat_id,
+            prod_seconds=24 * 60 * 60,   # сутки
+            test_seconds=30,
+            kind="case_story"
+        )
 
 
 # =========================================================
