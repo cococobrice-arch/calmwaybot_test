@@ -14,19 +14,21 @@ from aiogram.types import (
 )
 from aiogram.exceptions import TelegramBadRequest
 
+# -------------------- Логи --------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# -------------------- Переменные окружения --------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-LINK = os.getenv("LINK_TO_MATERIAL")
+LINK = os.getenv("LINK_TO_MATERIAL")  # ссылка или локальный путь
 VIDEO_NOTE_FILE_ID = os.getenv("VIDEO_NOTE_FILE_ID")
 DB_PATH = os.getenv("DATABASE_PATH", "users.db")
 CHANNEL_USERNAME = "@OcdAndAnxiety"
 
-MODE = os.getenv("MODE", "prod").lower()
-TEST_USER_ID = int(os.getenv("TEST_USER_ID", "0") or 0)
-SCHEDULER_POLL_INTERVAL = int(os.getenv("SCHEDULER_POLL_INTERVAL", "10"))
+MODE = os.getenv("MODE", "prod").lower()  # "prod" или "test"
+TEST_USER_ID = int(os.getenv("TEST_USER_ID", "0") or 0)  # ускоренный режим для конкретного пользователя
+SCHEDULER_POLL_INTERVAL = int(os.getenv("SCHEDULER_POLL_INTERVAL", "10"))  # интервал проверки задач, сек
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден в .env")
@@ -36,10 +38,16 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
+
+
+# =========================================================
+# 0. БАЗА ДАННЫХ И ПЛАНИРОВЩИК
+# =========================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
+    # WAL-режим для избежания блокировок при одновременных чтениях/записях
     cursor.execute("PRAGMA journal_mode=WAL;")
     cursor.execute("PRAGMA synchronous=NORMAL;")
 
@@ -80,6 +88,7 @@ def init_db():
             delivered INTEGER DEFAULT 0
         )
     """)
+
     conn.commit()
     conn.close()
 
@@ -98,10 +107,10 @@ def log_event(user_id: int, action: str, details: str = None):
 def upsert_user(user_id: int, step: str = None, subscribed: int = None, username: str = None):
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
     exists = cursor.fetchone()
-    now = datetime.now().isoformat(timespec='seconds')
 
+    now = datetime.now().isoformat(timespec='seconds')
     if exists:
         if step is not None and username is not None:
             cursor.execute("UPDATE users SET step=?, username=?, last_action=? WHERE user_id=?",
@@ -120,12 +129,12 @@ def upsert_user(user_id: int, step: str = None, subscribed: int = None, username
             "INSERT INTO users (user_id, source, step, subscribed, last_action, username) VALUES (?, ?, ?, ?, ?, ?)",
             (user_id, "unknown", step or "start", subscribed or 0, now, username)
         )
-
     conn.commit()
     conn.close()
 
 
 def purge_user(user_id: int):
+    """Полная очистка данных пользователя (для тестовых аккаунтов): users, answers, events, scheduled_messages."""
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM events WHERE user_id=?", (user_id,))
@@ -137,68 +146,237 @@ def purge_user(user_id: int):
 
 
 def is_fast_user(user_id: int) -> bool:
+    """
+    Пользователь быстрый, если:
+    - MODE=test   (весь бот в ускоренном режиме)
+    - user_id == FAST_USER_ID (точечный быстрый пользователь)
+    """
     if MODE == "test":
         return True
+
     fast_user_raw = os.getenv("FAST_USER_ID")
-    FAST_USER_ID = int(fast_user_raw) if fastisdigit := fast_user_raw and fast_user_raw.isdigit() else None
-    return FAST_USER_ID and user_id == FAST_USER_ID
+    FAST_USER_ID = int(fast_user_raw) if fast_user_raw and fast_user_raw.isdigit() else None
+
+    if FAST_USER_ID and user_id == FAST_USER_ID:
+        return True
+
+    return False
+
 
 
 async def smart_sleep(user_id: int, prod_seconds: int, test_seconds: int = 3):
-    await asyncio.sleep(test_seconds if is_fast_user(user_id) else prod_seconds)
+    delay = test_seconds if is_fast_user(user_id) else prod_seconds
+    await asyncio.sleep(delay)
 
 
-def schedule_message(user_id: int, prod_seconds: int, test_seconds: int, kind: str, payload: str = None):
+
+def schedule_message(user_id: int, prod_seconds: int, kind: str, payload: str = None, test_seconds: int = 3):
+    """
+    Создаём отложенное сообщение в таблице scheduled_messages.
+    prod_seconds — задержка в проде,
+    test_seconds — задержка в тесте/для тестового пользователя.
+    """
     delay = test_seconds if is_fast_user(user_id) else prod_seconds
     send_at = datetime.now() + timedelta(seconds=delay)
+    send_at_str = send_at.isoformat(timespec='seconds')
 
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
 
-    cursor.execute("DELETE FROM scheduled_messages WHERE user_id=? AND kind=? AND delivered=0",
-                   (user_id, kind))
+    # Чтобы не плодить дубли — удаляем старые недоставленные задачи такого же типа
+    cursor.execute(
+        "DELETE FROM scheduled_messages WHERE user_id=? AND kind=? AND delivered=0",
+        (user_id, kind)
+    )
 
     cursor.execute(
         "INSERT INTO scheduled_messages (user_id, send_at, kind, payload, delivered) VALUES (?, ?, ?, ?, 0)",
-        (user_id, send_at.isoformat(timespec='seconds'), kind, payload)
+        (user_id, send_at_str, kind, payload)
     )
     conn.commit()
     conn.close()
+
+    log_event(user_id, "scheduled_message_created", f"{kind} @ {send_at_str}")
+
 
 def mark_message_delivered(task_id: int):
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
-    cursor.execute("UPDATE scheduled_messages SET delivered=1 WHERE id=?", (task_id,))
+    cursor.execute(
+        "UPDATE scheduled_messages SET delivered=1 WHERE id=?",
+        (task_id,)
+    )
     conn.commit()
     conn.close()
 
 
-init_db()
-
 # =========================================================
-# /start — одна кнопка «📘 Открыть PDF»
+# 0.1. ОБРАБОТКА ОТЛОЖЕННЫХ ЗАДАЧ
+# =========================================================
+async def send_channel_invite(chat_id: int):
+    """Отправка приглашения в канал (только если человек не подписан)."""
+    is_subscribed = False
+    try:
+        member = await bot.get_chat_member(CHANNEL_USERNAME, chat_id)
+        status = getattr(member, "status", None)
+        is_subscribed = status in {"member", "administrator", "creator"}
+        upsert_user(chat_id, subscribed=1 if is_subscribed else 0)
+        log_event(chat_id, "bot_subscription_checked", f"Подписан: {is_subscribed}")
+    except TelegramBadRequest as e:
+        logger.warning(f"Не удалось проверить подписку: {e} (считаем подписанным, приглашение не шлём)")
+        is_subscribed = True
+        log_event(chat_id, "bot_subscription_checked", "Ошибка проверки, считаем подписанным")
+    except Exception as e:
+        logger.warning(f"Сбой проверки подписки: {e} (считаем подписанным, приглашение не шлём)")
+        is_subscribed = True
+        log_event(chat_id, "bot_subscription_checked", "Ошибка проверки (Exception) — считаем подписанным")
+
+    if is_subscribed:
+        # Уже подписан — просто выходим
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Подписаться на канал", url="https://t.me/OcdAndAnxiety")]
+        ]
+    )
+    text = (
+        "У меня есть телеграм-канал, где я делюсь нюансами об эффективных способах преодоления тревоги "
+        "и развеиваю мифы о <i>не</i>работающих методах. "
+        "Никакой воды — только проверенные решения 💧🙅🏻‍♂️\n\n"
+        "Например, я писал там посты:\n\n"
+        "🔸 <a href=\"https://t.me/OcdAndAnxiety/16\">Как неправильное дыхание усиливает паническую атаку</a>\n"
+        "🔸 <a href=\"https://t.me/OcdAndAnxiety/17\">Алкоголь и первый приступ ПА</a>\n"
+        "🔸 <a href=\"https://t.me/OcdAndAnxiety/28\">Каковы опасные цифры давления?</a>\n"
+        "🔸 <a href=\"https://t.me/OcdAndAnxiety/34\">Волшебный газ для успокоения?</a>\n\n"
+        "Подписывайтесь и получайте практические рекомендации 👇🏽"
+    )
+    try:
+        await bot.send_message(
+            chat_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+            disable_web_page_preview=True
+        )
+        log_event(chat_id, "bot_channel_invite_sent", "Отправлено приглашение подписаться на канал")
+    except Exception as e:
+        logger.warning(f"Ошибка отправки приглашения на канал: {e}")
+
+
+# Вперёд объявим сигнатуры, чтобы не ругался линтер/IDE
+async def send_avoidance_intro(chat_id: int):
+    ...
+async def send_case_story(chat_id: int):
+    ...
+async def send_final_message(chat_id: int):
+    ...
+async def send_final_block2(chat_id: int):
+    ...
+async def send_final_block3(chat_id: int):
+    ...
+
+
+async def process_scheduled_message(task_id: int, user_id: int, kind: str, payload: str | None):
+    """Маршрутизация отложенных задач по типу kind."""
+    try:
+        if kind == "channel_invite":
+            await send_channel_invite(user_id)
+        elif kind == "avoidance_intro":
+            await send_avoidance_intro(user_id)
+        elif kind == "case_story":
+            await send_case_story(user_id)
+        elif kind == "final_block1":
+            await send_final_message(user_id)
+        elif kind == "final_block2":
+            await send_final_block2(user_id)
+        elif kind == "final_block3":
+            await send_final_block3(user_id)
+        else:
+            logger.warning(f"Неизвестный тип отложенного сообщения: {kind} для user_id={user_id}")
+            log_event(user_id, "scheduled_message_unknown_kind", kind)
+    finally:
+        # В любом случае помечаем задачу как обработанную, чтобы не зациклиться
+        mark_message_delivered(task_id)
+
+
+async def scheduler_worker():
+    """Фоновый воркер: регулярно проверяет таблицу scheduled_messages и отправляет всё, что пора."""
+    logger.info("Запущен воркер отложенных сообщений.")
+    while True:
+        try:
+            now = datetime.now().isoformat(timespec='seconds')
+            conn = sqlite3.connect(DB_PATH, timeout=10)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, user_id, kind, payload FROM scheduled_messages "
+                "WHERE delivered=0 AND send_at <= ? "
+                "ORDER BY send_at ASC LIMIT 50",
+                (now,)
+            )
+            rows = cursor.fetchall()
+            conn.close()
+
+            if not rows:
+                await asyncio.sleep(SCHEDULER_POLL_INTERVAL)
+                continue
+
+            for task_id, user_id, kind, payload in rows:
+                try:
+                    await process_scheduled_message(task_id, user_id, kind, payload)
+                except Exception as e:
+                    logger.exception(f"Ошибка при обработке задачи {task_id} ({kind}) для user_id={user_id}: {e}")
+                    # Если хотим, можно НЕ помечать как delivered, чтобы попробовать ещё раз
+        except Exception as e:
+            logger.exception(f"Сбой воркера отложенных сообщений: {e}")
+        await asyncio.sleep(SCHEDULER_POLL_INTERVAL)
+
+
+init_db()
+# =========================================================
+# 1. ПРИВЕТСТВИЕ (/start)
 # =========================================================
 @router.message(F.text == "/start")
 async def cmd_start(message: Message):
     user_id = message.from_user.id
-    uname = (message.from_user.username or "").strip() or None
+    uname = (message.from_user.username or "").strip()
+    display_uname = uname if uname else None
 
+    # ------------------------------
+    # Загрузка тестовых ID из .env
+    # ------------------------------
     test_ids_raw = os.getenv("TEST_USER_IDS", "")
-    TEST_USER_IDS = {int(x) for x in test_ids_raw.split(",") if x.strip().isdigit()} if test_ids_raw else set()
+    TEST_USER_IDS = set()
+    if test_ids_raw:
+        try:
+            TEST_USER_IDS = {int(x.strip()) for x in test_ids_raw.split(",") if x.strip().isdigit()}
+        except:
+            TEST_USER_IDS = set()
+
+    fast_user_id_raw = os.getenv("FAST_USER_ID")
+    FAST_USER_ID = int(fast_user_id_raw) if fast_user_id_raw and fast_user_id_raw.isdigit() else None
+
     purge_flag = os.getenv("PURGE_TEST_USERS_ON_START", "false").lower() == "true"
 
+    # ----------------------------------------------------
+    # 1️⃣ Полная очистка ТОЛЬКО для трёх тестовых ID
+    # ----------------------------------------------------
     if purge_flag and user_id in TEST_USER_IDS:
         purge_user(user_id)
-        log_event(user_id, "purge_on_start", "Тестовый пользователь очищен")
+        log_event(user_id, "purge_on_start", "Тестовый пользователь — данные очищены при /start")
 
-    upsert_user(user_id, step="start", username=uname)
+    # ----------------------------------------------------
+    # 2️⃣ Обновляем данные пользователя (создаём если нет)
+    # ----------------------------------------------------
+    upsert_user(user_id, step="start", username=display_uname)
     log_event(user_id, "user_start", "Пользователь запустил бота")
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📘 Открыть PDF", callback_data="open_pdf")]
-        ]
-    )
+    # ----------------------------------------------------
+    # 3️⃣ Отправляем приветствие и кнопку
+    # ----------------------------------------------------
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📘 Получить гайд", callback_data="get_material")]
+    ])
 
     await message.answer(
         """Если Вы зашли в этот бот, значит, Ваши тревоги уже успели сильно вмешаться в жизнь.\n 
@@ -217,22 +395,17 @@ async def cmd_start(message: Message):
         parse_mode="HTML",
         reply_markup=kb
     )
-
 # =========================================================
-# 2. ЕДИНЫЙ БЛОК «📘 ОТКРЫТЬ PDF» — кружок + PDF + планировщики + fallback
+# 2. ОТПРАВКА ГАЙДА
 # =========================================================
-
-@router.callback_query(F.data == "open_pdf")
-async def unified_open_pdf(callback: CallbackQuery):
+@router.callback_query(F.data == "get_material")
+async def send_material(callback: CallbackQuery):
     chat_id = callback.message.chat.id
-    uname = (callback.from_user.username or "").strip() or None
+    uname = (callback.from_user.username or "").strip() if callback.from_user else None
+    upsert_user(chat_id, step="got_material", username=uname or None)
+    log_event(chat_id, "user_clicked_get_material", "Нажал «Получить гайд»")
 
-    await callback.answer()
-
-    upsert_user(chat_id, step="got_material", username=uname)
-    log_event(chat_id, "user_clicked_get_material", "Нажал единую кнопку «Открыть PDF»")
-    log_event(chat_id, "user_opened_pdf", "Открыл PDF через единую кнопку")
-
+    # Кружок
     if VIDEO_NOTE_FILE_ID:
         try:
             await bot.send_chat_action(chat_id, "upload_video_note")
@@ -241,17 +414,16 @@ async def unified_open_pdf(callback: CallbackQuery):
         except Exception as e:
             logger.warning(f"Не удалось отправить кружок: {e}")
 
+    # Материал
     if LINK and os.path.exists(LINK):
-        await bot.send_document(
-            chat_id,
-            FSInputFile(LINK, filename="Выход из панического круга.pdf"),
-            caption="Вот Ваш первый шаг к спокойствию 🧘🏻‍♀️"
-        )
+        file = FSInputFile(LINK, filename="Выход из панического круга.pdf")
+        await bot.send_document(chat_id, document=file, caption="Вот Ваш первый шаг к спокойствию 🧘🏻‍♀️")
     elif LINK and LINK.startswith("http"):
         await bot.send_message(chat_id, f"📘 Ваш материал доступен по ссылке: {LINK}")
     else:
         await bot.send_message(chat_id, "⚠️ Файл не найден. Попробуйте позже.")
 
+    # 2) приглашение в канал — через 20 минут
     schedule_message(
         user_id=chat_id,
         prod_seconds=20 * 60,
@@ -259,6 +431,7 @@ async def unified_open_pdf(callback: CallbackQuery):
         kind="channel_invite"
     )
 
+    # 3) приглашение к тесту избегания — через сутки
     schedule_message(
         user_id=chat_id,
         prod_seconds=24 * 60 * 60,
@@ -266,12 +439,17 @@ async def unified_open_pdf(callback: CallbackQuery):
         kind="avoidance_intro"
     )
 
+    # ВАЖНО: ДОБАВЛЕНО — чтобы человек, который НЕ прошёл тест, всё равно получил историю
     schedule_message(
         user_id=chat_id,
         prod_seconds=24 * 60 * 60,
         test_seconds=30,
-        kind="avoidance_fallback"
+        kind="case_story"
     )
+
+    await callback.answer()
+
+
 # =========================================================
 # 4. ОПРОС ПО ИЗБЕГАНИЮ
 # =========================================================
@@ -305,35 +483,22 @@ async def start_avoidance_test(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     await callback.answer()
 
-    # удаляем старые ответы, если тест уже проходился раньше, и отменяем fallback
+    # удаляем ответы прошлого теста
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM answers WHERE user_id=?", (chat_id,))
-    cursor.execute(
-        "DELETE FROM scheduled_messages WHERE user_id=? AND kind='avoidance_fallback' AND delivered=0",
-        (chat_id,)
-    )
     conn.commit()
     conn.close()
 
-    # фиксируем этап и логируем
     upsert_user(chat_id, step="avoidance_test")
     log_event(chat_id, "user_clicked_avoidance_start", "Начал опрос избегания")
 
-    # удаляем кнопку "Начать тест", чтобы она исчезла навсегда
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-    # начинаем тест
-    await bot.send_message(
-        chat_id,
-        "Сейчас я дам Вам несколько вопросов про то, как Вы ведёте себя в ситуации страха.\n"
-        "Пожалуйста, отвечайте честно — здесь нет правильных или неправильных ответов."
-    )
-    log_event(chat_id, "avoidance_test", "Тест избегания запущен")
-
+    await bot.send_message(chat_id, "Итак, начнём:")
     await send_question(chat_id, 0)
 
 
@@ -351,69 +516,86 @@ async def send_question(chat_id: int, index: int):
     await bot.send_message(chat_id, f"{index + 1}. {q}", reply_markup=kb)
 
 
-@router.callback_query(F.data.startswith("ans_yes_"))
-async def handle_yes(callback: CallbackQuery):
-    chat_id = callback.message.chat.id
-    await callback.answer()
-    index_str = callback.data.split("_")[-1]
+@router.callback_query(F.data.startswith("ans_"))
+async def handle_answer(callback: CallbackQuery):
     try:
-        index = int(index_str)
-    except ValueError:
-        return
+        await callback.answer()
+    except Exception:
+        pass
 
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO answers (user_id, question, answer) VALUES (?, ?, ?)",
-        (chat_id, index, "yes")
+    chat_id = callback.message.chat.id
+    try:
+        _, ans, idx = callback.data.split("_")
+        idx = int(idx)
+
+        # УДАЛЕНО: сохранение ответов в БД
+
+        log_event(chat_id, "user_answer", f"Вопрос {idx + 1}: {ans.upper()}")
+
+        # мгновенная отправка следующего вопроса
+        await smart_sleep(chat_id, prod_seconds=0, test_seconds=0)
+
+        if idx + 1 < len(avoidance_questions):
+            await send_question(chat_id, idx + 1)
+            await asyncio.sleep(0.1)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        else:
+            await smart_sleep(chat_id, prod_seconds=0, test_seconds=0)
+            await finish_test(chat_id)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+    except Exception as e:
+        import traceback
+        logger.error("handle_answer failed: %s\n%s", e, traceback.format_exc())
+        try:
+            await bot.send_message(chat_id, "Техническая заминка при обработке ответа. Попробуйте ещё раз.")
+        except Exception:
+            pass
+# =========================================================
+# 4.1. Итог теста
+# =========================================================
+def _cta_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Хорошо 😌", callback_data="avoidance_ok"),
+                InlineKeyboardButton(text="Нет, пока боюсь 🙈", callback_data="avoidance_scared"),
+            ]
+        ]
     )
-    conn.commit()
-    conn.close()
 
+
+@router.callback_query(F.data == "avoidance_ok")
+async def handle_avoidance_ok(callback: CallbackQuery):
+    await callback.answer()
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
+    await bot.send_message(callback.message.chat.id, "Супер! У Вас всё получится! 💪🏼")
+    log_event(callback.message.chat.id, "user_avoidance_response", "Ответил: Хорошо 😌")
 
-    await send_question(chat_id, index + 1)
 
-
-@router.callback_query(F.data.startswith("ans_no_"))
-async def handle_no(callback: CallbackQuery):
-    chat_id = callback.message.chat.id
+@router.callback_query(F.data == "avoidance_scared")
+async def handle_avoidance_scared(callback: CallbackQuery):
     await callback.answer()
-    index_str = callback.data.split("_")[-1]
-    try:
-        index = int(index_str)
-    except ValueError:
-        return
-
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO answers (user_id, question, answer) VALUES (?, ?, ?)",
-        (chat_id, index, "no")
-    )
-    conn.commit()
-    conn.close()
-
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-
-    await send_question(chat_id, index + 1)
+    await bot.send_message(callback.message.chat.id, "Ничего, иногда нужно собраться с силами, чтобы решиться на то, что тревожно 🫶🏼")
+    log_event(callback.message.chat.id, "user_avoidance_response", "Ответил: Нет, пока боюсь 🙈")
 
 
 async def finish_test(chat_id: int):
-    # собираем ответы
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    cursor = conn.cursor()
-    cursor.execute("SELECT answer FROM answers WHERE user_id=?", (chat_id,))
-    rows = cursor.fetchall()
-    conn.close()
-
-    yes_count = sum(1 for (ans,) in rows if ans == "yes")
+    # Раньше здесь считались ответы. Теперь — всегда 0.
+    yes_count = 0
 
     upsert_user(chat_id, step="avoidance_done")
     log_event(chat_id, "user_finished_test", f"Ответов 'ДА': {yes_count}")
@@ -428,131 +610,133 @@ async def finish_test(chat_id: int):
 
     # 6. "Тест завершён" — сразу
     await bot.send_message(chat_id, "Тест завершён. Подождите секунду, обрабатываем результаты ⏳")
-    await smart_sleep(chat_id, prod_seconds=3, test_seconds=1)  # 7. "Судя по Вашим ответам" — через 3 секунды
 
-    if yes_count >= 4:
-        part1 = (
-            "Судя по Вашим ответам, Вам приходится довольн"
-            "о сильно подстраивать свою жизнь под "
-            "<b><i>избегание</i></b> возможных повторных приступ...о ловушка, в которую попадаются очень многие люди 🪤\n\n" + chain
-        )
-        part2 = (
-            "☀️ Хорошая новость в том, что мы в силах менять стр...ию своих действий — и тем самым разрывать этот порочный круг.\n"
-            "Если тревога долгое время диктовала правила, естест...траху будут ощущаться как последнее, чем захочется заниматься. "
-            "Кажется, будто без этих «страхующих» привычек станет невыносимо дискомфортно. "
-            "Но каждый раз, когда мы не убегаем, а остаёмся в пу...лучает новый опыт — что <i>опасность была преувеличена</i>.\n\n"
-            "Вы уже почитали в моём гайде о том, как правильно отвечать себе на пугающие <u>мысли</u>. "
-            "Поэтому теперь, держа под рукой эту памятку, Вы можете и в своих <u>действиях</u>"
-            "выходить из замкнутого круга тревоги.\n\n"
-            "Именно так и работают современные методы терапии панических приступов — "
-            "через постепенное, выверенное столкновение со страхами и пересмотр привычных реакций.\n\n"
-            "Я рядом, и готов помочь Вам пройти этот путь."
-        )
-    else:
-        part1 = (
-            "Судя по Вашим ответам, Вы почти не подстраиваете жизнь под избегание паники — "
-            "и это отличный знак! Это означает, что многие способы, которыми Вы реагируете на страх, "
-            "уже помогают Вам не усиливать его.\n\n" + chain
-        )
-        part2 = (
-            "Тем не менее, даже если избегание выражено слабо, тревога может сохраняться — "
-            "особенно если пугающие ощущения появляются внезапно.\n\n"
-            "То, что помогает окончательно закрыть эту тему — это научиться правильно отвечать себе "
-            "на внезапные пугающие мысли, которые мелькают во время приступа.\n\n"
-            "В гайде Вы уже видели примеры таких ответов. "
-            "Если Вы будете регулярно применять их в нужный момент, приступы постепенно утратят силу."
-        )
+    # 7. "Судя по Вашим ответам..." — через 3 секунды
+    await smart_sleep(chat_id, prod_seconds=3, test_seconds=1)
 
-    # отправляем интерпретацию
-    await bot.send_message(chat_id, part1, parse_mode="HTML")
-    await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
-    await bot.send_message(chat_id, part2, parse_mode="HTML")
-
-    # призыв посмотреть условия консультации
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Узнать про консультации",
-                    callback_data="open_consult"
-                )
-            ]
-        ]
-    )
-    await bot.send_message(chat_id, "Если хотите, расскажу, как проходят консультации.", reply_markup=kb)
-
-
-# =========================================================
-# Fallback: если юзер НЕ начал тест → продолжаем цепочку
-# =========================================================
-async def avoidance_fallback(chat_id: int):
-    """
-    Если пользователь НЕ нажал «Начать тест» в течение суток (или 30 сек в тестовом режиме),
-    продолжаем воронку как будто тест завершён.
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT step FROM users WHERE user_id=?", (chat_id,))
-    row = cursor.fetchone()
-    conn.close()
-
-    user_step = row[0] if row else None
-
-    # если тест начат или завершён — ничего не делаем
-    if user_step in ("avoidance_test", "avoidance_done"):
-        return
-
-    await send_case_story(chat_id)
-
-
-# =========================================================
-# 5. БЛОК ПОСЛЕ ТЕСТА — “Чтобы ослабить власть тревоги…”
-# =========================================================
-async def send_case_story(chat_id: int):
-    await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
-
+    # Ветка yes_count == 0 — оставляем полностью оригинальный текст
     text = (
-        "Чтобы ослабить власть тревоги и уменьшить силу приступов, важно не только знать, "
-        "что происходит с телом во время паники, но и начать менять своё поведение.\n\n"
-        "Давайте расскажу историю одной моей пациентки."
+        "Судя по Вашим ответам, Вы не позволяете страху менять Ваш образ жизни. Это отлично!\n\n"
+        "Если у Вас есть какие-то <b><i>избегания</i></b>, которые не попали в опросник, то теперь — держа под рукой памятку — "
+        "можно и в <u>действиях</u> вернуть себе полностью нормальную жизнь.\n\n"
+        "Примеры:\n"
+        "🔹 Стараетесь не вспоминать про паническую атаку? 👉🏼 Повспоминайте про неё специально.\n\n"
+        "🔹 Избегаете места первого приступа? 👉🏼 Посетите его ещё раз.\n\n\n"
+        "Это будет дискомфортно, но я обещаю: это даст Вам больше уверенности в Вашей способности справляться со страхом 🦁\n\n"
+        "Попробуете?"
     )
-    await bot.send_message(chat_id, text)
+    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_cta_keyboard())
 
-    # Следующий блок через сутки
+    # 10. "Чтобы ослабить власть тревоги..." — через сутки после теста
     schedule_message(
         user_id=chat_id,
         prod_seconds=24 * 60 * 60,
-        kind="final_block1",
-        test_seconds=5
+        test_seconds=5,
+        kind="case_story"
     )
 
 
 # =========================================================
-# 6. Финальные блоки сообщений
+# 5. ДАЛЬНЕЙШИЕ ЭТАПЫ
 # =========================================================
+async def send_case_story(chat_id: int):
+    logger.info(f"→ Начато send_case_story для chat_id={chat_id}")
+    text = (
+        "<b>Чтобы ослабить власть тревоги над нами, нам нужно начать делать то, что страшно.</b>\n\n"
+        "Теперь я хочу показать Вам, как это выглядит на практике. \n\n"   
+        "Помните историю из моего гайда про девушку, у которой приступ впервые случился после разговора с руководителем?\n"
+        "Полгода она жила в постоянном ожидании нового приступа, пока не решилась прийти на терапию. Наши с ней занятия состояли из двух блоков.\n\n"
+        "<b>Экспозиция.</b>\n\n"
+        "Когда она обратилась ко мне, метро уже давно стало для неё источником угрозы 🚇 "
+        "Её внутренний детектор опасности научился воспринимать нахождение в замкнутом пространстве как зашкаливающий риск.\n\n"
+        "Мы начали с пошагового возвращения в эти ситуации: находясь на видеосвязи со мной, она стала спускаться на платформу. "
+        "Для начала чтобы просто постоять там и позволить себе оставаться в тревоге и выдерживать её наплывы. "
+        "Затем чтобы делать короткие поездки — на одну-две станции.\n\n"
+        "Каждый этап, конечно же, сопровождался сопротивлением со стороны её тела и психики, которые во всю сигнализировали ей, "
+        "что в тоннеле должно случиться что-то ужасное. Но мы заранее составляли план того, к появлению каких страшилок в голове нужно быть готовой, "
+        "и как на них отвечать 🛡\n"
+        "И через несколько недель она снова научилась проезжать привычный маршрут.\n\n"
+        "<b>Изменение убеждений.</b>\n\n"
+        "По мере того, как мы обсуждали её жизненные обстоятельства, постепенно стало ясно, что паника была не просто страхом "
+        "задохнуться или потерять сознание. В её основе лежали уже ставшие естественными для неё установки: "
+        "<i>постоянно соответствовать ожиданиям других людей, быть безошибочной, никого не разочаровывать</i>. "
+        "Это вызывало хроническое напряжение, истощало её силы и делало нервную систему уязвимой. "
+        "А разговор с начальником стал ситуацией, которая «вышибла пробки» от перенапряжения и разочарования.\n\n"
+        "Спустя месяцы, когда она начала <u>делегировать задачи</u> другим людям, заявлять о своих <u>потребностях</u>, "
+        "выполнять дела не на «5», а <u>на «4»</u> и не проверять каждое своё слово — внутреннее напряжение стало спадать. "
+        "И тогда для её психики исчезла необходимость защищаться от былого надрыва с помощью панических атак.\n\n"
+        "Сейчас она снова спокойно перемещается по городу, отдыхает по выходным и не живёт в ожидании очередного приступа ⛱"
+    )
+    await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+    upsert_user(chat_id, step="case_story")
+    log_event(chat_id, "bot_case_story_sent", "Отправлена история пациента")
+
+    # 11. Далее – через сутки
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=24 * 60 * 60,
+        test_seconds=5,
+        kind="final_block1"
+    )
+
+
 async def send_final_message(chat_id: int):
     await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
 
-    text = (
+    photo = FSInputFile("media/DSC03503.jpg")
+
+    caption = (
         "С людьми, переживающими панические атаки, я работаю каждый день, "
         "и я хорошо знаю, как важно не откладывать обращение за помощью. "
         "Потому что со временем тревога перестаёт быть лишь реакцией на стресс и начинает определять Ваш образ мыслей и восприятия.\n\n"
         "<b>Как я могу помочь Вам?</b>\n\n"
-        "На индивидуальных консультациях мы можем вместе разобраться, из чего складывается <i>именно Ваш цикл тревоги</i>: "
+        "На индивидуальных консультациях мы можем вместе разобрать, из чего складывается <i>именно Ваш цикл тревоги</i>: "
         "какие мысли, телесные реакции и привычные способы поведения поддерживают его. Мы составим для Вас подробный план действий: "
-        "от списка необходимых обследований - до распорядка упраженений по преодолению страха.\n\n"
-        "По итогам прохождения психотерапии Вы сможете не только сократить количество приступов, "
-        "но и полностью вернуть себе качество жизни."
+        "от списка необходимых обследований - до распорядка упражнений по преодолению страха.\n\n"
     )
 
-    photo = FSInputFile("media/DSC03503.jpg")
-    await bot.send_photo(chat_id, photo=photo, caption=text, parse_mode="HTML")
+    await bot.send_photo(
+        chat_id,
+        photo=photo,
+        caption=caption,
+        parse_mode="HTML"
+    )
+
+    await smart_sleep(chat_id, prod_seconds=60, test_seconds=3)
+
+    text = (
+        "По итогам прохождения психотерапии Вы получите:\n\n"
+        "✨ снижение <b>гиперконтроля и проверок</b> собственного состояния: больше не нужно будет постоянно измерять пульс, "
+        "дышать по инструкции или судорожно искать врачей\n\n"
+        "✨ способность <b>снова свободно выходить из дома, ездить в метро, летать на самолётах, водить машину</b> — без страха, что станет плохо\n\n"
+        "✨ умение <b>оставаться в контакте с тревогой</b>, не убегая от неё — и благодаря этому не попадать в замкнутый круг\n\n"
+        "✨ <b>чувство гордости и уважения к себе</b> за то, что вы справляетесь без избеганий, лишних лекарств или алкоголя\n\n"
+        "✨ способность <b>жить спонтанно и легко</b>, не подстраиваясь под ограничения и не тратя силы на борьбу с внутренним напряжением\n\n"
+        "✨ крепкую внутреннюю <b>убежденность, что с Вами всё в порядке</b>\n\n"
+        "Моя задача - привести Вашу жизнь в норму <u>во всех аспектах</u>. "
+        "Это означает не только помочь избавиться от симптомов болезни, но и вернуть Вам энергию, способность чувствовать увлеченность, "
+        "возможность создавать и поддерживать связь с другими людьми и заботиться о своем физическом здоровье.\n\n"
+        "Почитать подробнее о том, как проходит психотерапия со мной 👇"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Узнать про консультации", url="https://лечение-паники.рф/консультации")]
+        ]
+    )
+
+    await bot.send_message(
+        chat_id,
+        text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
 
     schedule_message(
         user_id=chat_id,
         prod_seconds=24 * 60 * 60,
-        kind="final_block2",
-        test_seconds=5
+        test_seconds=5,
+        kind="final_block2"
     )
 
 
@@ -584,8 +768,8 @@ async def send_final_block2(chat_id: int):
     schedule_message(
         user_id=chat_id,
         prod_seconds=24 * 60 * 60,
-        kind="final_block3",
-        test_seconds=5
+        test_seconds=5,
+        kind="final_block3"
     )
 
 
@@ -631,35 +815,7 @@ async def send_final_block3(chat_id: int):
 
 
 # =========================================================
-# 7. CTA — Узнать про консультации → Перейти на сайт
-# =========================================================
-@router.callback_query(F.data == "open_consult")
-async def open_consult(callback: CallbackQuery):
-    chat_id = callback.message.chat.id
-
-    log_event(chat_id, "user_clicked_consult_cta", "Переход к консультациям")
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Перейти на страницу консультаций",
-                    url="https://лечение-паники.рф/консультации"
-                )
-            ]
-        ]
-    )
-
-    try:
-        await callback.message.edit_reply_markup(reply_markup=keyboard)
-    except Exception:
-        pass
-
-    await callback.answer()
-
-
-# =========================================================
-# 8. Запуск
+# 6. ЗАПУСК
 # =========================================================
 async def main():
     logger.info(f"Бот запущен. MODE={MODE}, TEST_USER_ID={TEST_USER_ID or '—'}")
