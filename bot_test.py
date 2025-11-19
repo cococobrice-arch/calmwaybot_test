@@ -217,14 +217,14 @@ async def send_channel_invite(chat_id: int):
         member = await bot.get_chat_member(CHANNEL_USERNAME, chat_id)
         status = getattr(member, "status", None)
         is_subscribed = status in {"member", "administrator", "creator"}
-        is_subscribed = status in {"member", "administrator", "creator"}
-        upsert_user(chat_id, subscribed=1 if is_subscribed else 0)
-    except TelegramBadRequest as e:
+        upsert_user(chat_id, subscribed=1 if is_subscribed else 0)    except TelegramBadRequest as e:
         logger.warning(f"Не удалось проверить подписку: {e} (считаем подписанным, приглашение не шлём)")
-        is_subscribed = True
-    except Exception as e:
+        is_subscribed = True    except Exception as e:
         logger.warning(f"Сбой проверки подписки: {e} (считаем подписанным, приглашение не шлём)")
         is_subscribed = True
+    if is_subscribed:
+        # Уже подписан — просто выходим
+        return
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -521,7 +521,7 @@ async def handle_answer(callback: CallbackQuery):
         conn.commit()
         conn.close()
 
-        #}")  # отключено для приватности
+        #  # отключено для приватности
 
         # небольшая пауза и сразу отправляем следующий вопрос
         await smart_sleep(chat_id, prod_seconds=0, test_seconds=0)  # фактически без задержки
