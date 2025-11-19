@@ -457,8 +457,6 @@ async def send_avoidance_intro(chat_id: int):
         inline_keyboard=[[InlineKeyboardButton(text="Начать тест", callback_data="avoidance_start")]]
     )
     await bot.send_message(chat_id, text, reply_markup=kb)
-    log_event(chat_id, "bot_avoidance_invite_sent", "Предложен опрос избегания")
-
 
 @router.callback_query(F.data == "avoidance_start")
 async def start_avoidance_test(callback: CallbackQuery):
@@ -523,7 +521,7 @@ async def handle_answer(callback: CallbackQuery):
         conn.commit()
         conn.close()
 
-        # log_event(chat_id, "user_answer", f"Вопрос {idx + 1}: {ans.upper()}")  # отключено для приватности
+        #}")  # отключено для приватности
 
         # небольшая пауза и сразу отправляем следующий вопрос
         await smart_sleep(chat_id, prod_seconds=0, test_seconds=0)  # фактически без задержки
