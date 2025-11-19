@@ -158,7 +158,13 @@ async def smart_sleep(user_id: int, prod_seconds: int, test_seconds: int = 3):
     await asyncio.sleep(delay)
 
 
-def schedule_message(user_id: int, prod_seconds: int, kind: str, payload: str | None = None, test_seconds: int = 3):
+def schedule_message(
+    user_id: int,
+    prod_seconds: int,
+    kind: str,
+    payload: str | None = None,
+    test_seconds: int = 3,
+):
     delay = test_seconds if is_fast_user(user_id) else prod_seconds
     send_at = datetime.now() + timedelta(seconds=delay)
 
@@ -193,7 +199,7 @@ async def process_scheduled_message(task_id: int, user_id: int, kind: str, paylo
         elif kind == "avoidance_intro":
             await send_avoidance_intro(user_id)
         elif kind == "case_story":
-            await send_case_story(user_id)
+            await send_case_story(user_id, payload)
         elif kind == "final_block1":
             await send_final_message(user_id)
         elif kind == "final_block2":
@@ -248,13 +254,11 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     username = (message.from_user.username or "").strip() or None
 
-
     TEST_USER_ID = int(os.getenv("FAST_USER_ID", "0") or 0)
 
     if user_id == TEST_USER_ID:
         purge_user(user_id)
         log_event(user_id, "purge_on_start", "Тестовый пользователь — данные очищены")
-    # ================================
 
     upsert_user(user_id, step="start", username=username)
     log_event(user_id, "user_start", "Пользователь запустил бота")
@@ -284,6 +288,7 @@ async def cmd_start(message: Message):
         parse_mode="HTML",
         reply_markup=kb,
     )
+
 
 # =========================================================
 # 2. МАТЕРИАЛ
@@ -339,10 +344,18 @@ async def send_channel_invite(chat_id: int):
     )
 
     try:
-        await bot.send_message(chat_id, text, reply_markup=kb)
+        await bot.send_message(
+            chat_id,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb,
+        )
         log_event(chat_id, "channel_invite_sent", "Приглашение отправлено")
-    except:
+    except Exception:
         log_event(chat_id, "channel_invite_failed", "Ошибка отправки приглашения")
+
+
 # =========================================================
 # 3. ОПРОС ИЗБЕГАНИЯ
 # =========================================================
@@ -417,6 +430,16 @@ async def handle_answer(callback: CallbackQuery):
         _, ans, idx_raw = callback.data.split("_")
         idx = int(idx_raw)
 
+        # сохраняем ответ в таблицу answers (без логирования по вопросам)
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO answers (user_id, question, answer) VALUES (?, ?, ?)",
+            (chat_id, idx, "yes" if ans == "yes" else "no"),
+        )
+        conn.commit()
+        conn.close()
+
         if idx + 1 < len(avoidance_questions):
             await send_question(chat_id, idx + 1)
         else:
@@ -424,14 +447,14 @@ async def handle_answer(callback: CallbackQuery):
 
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
-        except:
+        except Exception:
             pass
 
     except Exception as e:
         logger.error(f"Ошибка ответа: {e}")
         try:
             await bot.send_message(chat_id, "Ошибка обработки ответа. Попробуйте ещё раз.")
-        except:
+        except Exception:
             pass
 
 
@@ -456,11 +479,20 @@ async def handle_avoidance_ok(callback: CallbackQuery):
     await callback.answer()
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
-    except:
+    except Exception:
         pass
 
     await bot.send_message(chat_id, "Супер! У Вас всё получится! 💪🏼")
     log_event(chat_id, "user_avoidance_response", "Ответил: Хорошо 😌")
+
+    # человек ответил → делаем «быструю» историю (1 час / 5 секунд)
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=60 * 60,
+        test_seconds=5,
+        kind="case_story",
+        payload=str(callback.message.message_id),
+    )
 
 
 @router.callback_query(F.data == "avoidance_scared")
@@ -469,16 +501,33 @@ async def handle_avoidance_scared(callback: CallbackQuery):
     await callback.answer()
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
-    except:
+    except Exception:
         pass
 
     await bot.send_message(chat_id, "Ничего, иногда нужно собраться с силами, чтобы решиться на то, что тревожно 🫶🏼")
     log_event(chat_id, "user_avoidance_response", "Ответил: Нет, пока боюсь 🙈")
 
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=60 * 60,
+        test_seconds=5,
+        kind="case_story",
+        payload=str(callback.message.message_id),
+    )
+
 
 async def finish_test(chat_id: int):
+    # считаем количество ответов «ДА»
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+    cursor.execute("SELECT answer FROM answers WHERE user_id=?", (chat_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    yes_count = sum(1 for (ans,) in rows if isinstance(ans, str) and ans.lower() == "yes")
+
     upsert_user(chat_id, step="avoidance_done")
-    log_event(chat_id, "user_finished_test", "Тест завершён")
+    log_event(chat_id, "user_finished_test", f"Ответов 'ДА': {yes_count}")
 
     chain = (
         "Чем больше вынужденных ограничений мы накладываем на свою жизнь\n"
@@ -507,39 +556,31 @@ async def finish_test(chat_id: int):
 
     msg = await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_cta_keyboard())
 
-    # Проверяем, ответил ли пользователь на финальный вопрос (Хорошо / Боюсь)
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT action FROM events WHERE user_id=? AND action='user_avoidance_response' ORDER BY id DESC LIMIT 1",
-        (chat_id,)
+    # базовый сценарий: если человек никак не ответит,
+    # история придёт через сутки (или 30 секунд для тестового)
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=24 * 60 * 60,
+        test_seconds=30,
+        kind="case_story",
+        payload=str(msg.message_id),
     )
-    answered = cursor.fetchone()
-    conn.close()
-
-    # Планируем следующий шаг
-    if answered:
-        schedule_message(
-            user_id=chat_id,
-            prod_seconds=60 * 60,      # 1 час
-            test_seconds=5,
-            kind="case_story"
-        )
-    else:
-        schedule_message(
-            user_id=chat_id,
-            prod_seconds=24 * 60 * 60,   # сутки
-            test_seconds=30,
-            kind="case_story"
-        )
 
 
 # =========================================================
 # 4. БЛОКИ ПОСЛЕ ТЕСТА
 # =========================================================
 
-async def send_case_story(chat_id: int):
-
+async def send_case_story(chat_id: int, payload: str | None = None):
+    # пробуем убрать кнопки «Хорошо/Нет», если они ещё висят
+    if payload:
+        try:
+            msg_id = int(payload)
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=None)
+        except (ValueError, TelegramBadRequest):
+            pass
+        except Exception:
+            logger.exception("Не удалось убрать клавиатуру с финального сообщения теста")
 
     label = "История пациента"
 
@@ -573,7 +614,7 @@ async def send_case_story(chat_id: int):
     try:
         await bot.send_message(chat_id, text, parse_mode="HTML")
         log_event(chat_id, "message_case_story", "История пациента")
-    except:
+    except Exception:
         log_event(chat_id, "message_failed", "История пациента — недоставлено")
 
     upsert_user(chat_id, step="case_story")
@@ -601,7 +642,7 @@ async def send_final_message(chat_id: int):
     try:
         await bot.send_photo(chat_id, photo=photo, caption=caption, parse_mode="HTML")
         log_event(chat_id, "message_final_block1", "С людьми, переживающими панические атаки…")
-    except:
+    except Exception:
         log_event(chat_id, "message_failed", "Ошибка блока 1")
 
     await smart_sleep(chat_id, prod_seconds=60, test_seconds=3)
@@ -630,7 +671,7 @@ async def send_final_message(chat_id: int):
     try:
         await bot.send_message(chat_id, text2, parse_mode="HTML", reply_markup=kb)
         log_event(chat_id, "message_final_block1_second", "По итогам психотерапии…")
-    except:
+    except Exception:
         log_event(chat_id, "message_failed", "Ошибка блока 2")
 
     schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=5, kind="final_block2")
@@ -647,8 +688,8 @@ async def consult_show(callback: CallbackQuery):
     )
 
     try:
-        await bot.send_message(chat_id, text)
-    except:
+        await bot.send_message(chat_id, text, disable_web_page_preview=True)
+    except Exception:
         pass
 
 
@@ -673,7 +714,7 @@ async def send_final_block2(chat_id: int):
     try:
         await bot.send_message(chat_id, extra_text, parse_mode="HTML")
         log_event(chat_id, "message_final_block2", "Одно из самых частых сомнений…")
-    except:
+    except Exception:
         log_event(chat_id, "message_failed", "Ошибка блока 3")
 
     await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
@@ -717,7 +758,7 @@ async def send_final_block3(chat_id: int):
     try:
         await bot.send_message(chat_id, thoughts_text, parse_mode="HTML")
         log_event(chat_id, "message_final_block3", "Вам может казаться…")
-    except:
+    except Exception:
         log_event(chat_id, "message_failed", "Ошибка блока 4")
 
     upsert_user(chat_id, step="final_message_sent")
