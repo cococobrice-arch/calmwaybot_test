@@ -394,8 +394,18 @@ async def send_avoidance_intro(chat_id: int):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Начать тест", callback_data="avoidance_start")]]
     )
-    await bot.send_message(chat_id, text, reply_markup=kb)
+    msg = await bot.send_message(chat_id, text, reply_markup=kb)
     log_event(chat_id, "Показан блок с предложением теста", "Предложен опрос избегания")
+
+    # Если пользователь не нажал «Начать тест» в течение суток (прод) / 30 секунд (тест),
+    # убираем кнопку и переводим его к истории пациентки
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=24 * 60 * 60,
+        test_seconds=30,
+        kind="case_story",
+        payload=str(msg.message_id),
+    )
 
 
 @router.callback_query(F.data == "avoidance_start")
@@ -587,10 +597,12 @@ async def finish_test(chat_id: int):
         final_msg_id = msg.message_id
 
     if final_msg_id is not None:
+        # Если пользователь не нажал «Хорошо» или «Нет, боюсь» в течение суток (прод) / 30 секунд (тест),
+        # убираем кнопки и переводим его к истории пациентки
         schedule_message(
             user_id=chat_id,
             prod_seconds=24 * 60 * 60,
-            test_seconds=5,
+            test_seconds=30,
             kind="case_story",
             payload=str(final_msg_id),
         )
