@@ -144,18 +144,24 @@ def get_users():
     return rows
 
 
+# ============================
+# ФИКС: определяем интерес по LIKE
+# ============================
+
 def has_consult_interest(user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+
     cursor.execute("""
         SELECT 1 FROM events
-        WHERE user_id=?
-          AND action IN (
-            'Открыта информация о консультациях',
-            'Открыт раздел консультаций'
-          )
+        WHERE user_id = ?
+          AND (
+                action LIKE '%консультац%' OR
+                details LIKE '%консультац%'
+              )
         LIMIT 1
     """, (user_id,))
+
     row = cursor.fetchone()
     conn.close()
     return bool(row)
