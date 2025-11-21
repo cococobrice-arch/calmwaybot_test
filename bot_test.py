@@ -55,8 +55,7 @@ def init_db():
             step TEXT,
             subscribed INTEGER DEFAULT 0,
             last_action TEXT,
-            username TEXT,
-            consult_interested INTEGER DEFAULT 0
+            username TEXT
         )
     """)
 
@@ -90,13 +89,6 @@ def init_db():
         )
     """)
 
-    # Миграция для уже существующей таблицы users: добавляем consult_interested, если колонки ещё нет
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN consult_interested INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        # Колонка уже существует – тихо продолжаем
-        pass
-
     conn.commit()
     conn.close()
 
@@ -122,25 +114,17 @@ def upsert_user(user_id: int, step: str | None = None, subscribed: int | None = 
 
     if exists:
         if step is not None and username is not None:
-            cursor.execute(
-                "UPDATE users SET step=?, username=?, last_action=? WHERE user_id=?",
-                (step, username, now, user_id),
-            )
+            cursor.execute("UPDATE users SET step=?, username=?, last_action=? WHERE user_id=?",
+                           (step, username, now, user_id))
         elif step is not None:
-            cursor.execute(
-                "UPDATE users SET step=?, last_action=? WHERE user_id=?",
-                (step, now, user_id),
-            )
+            cursor.execute("UPDATE users SET step=?, last_action=? WHERE user_id=?",
+                           (step, now, user_id))
         if subscribed is not None:
-            cursor.execute(
-                "UPDATE users SET subscribed=?, last_action=? WHERE user_id=?",
-                (subscribed, now, user_id),
-            )
+            cursor.execute("UPDATE users SET subscribed=?, last_action=? WHERE user_id=?",
+                           (subscribed, now, user_id))
         if username is not None and step is None:
-            cursor.execute(
-                "UPDATE users SET username=?, last_action=? WHERE user_id=?",
-                (username, now, user_id),
-            )
+            cursor.execute("UPDATE users SET username=?, last_action=? WHERE user_id=?",
+                           (username, now, user_id))
     else:
         cursor.execute(
             "INSERT INTO users (user_id, source, step, subscribed, last_action, username) VALUES (?, ?, ?, ?, ?, ?)",
@@ -251,6 +235,7 @@ async def expire_after_test(user_id: int, payload: str | None):
 # =========================================================
 
 async def process_scheduled_message(task_id: int, user_id: int, kind: str, payload: str | None):
+
     log_event(user_id, "Запуск отложенного сообщения", kind)
 
     try:
@@ -297,16 +282,13 @@ async def scheduler_worker():
 
             conn = sqlite3.connect(DB_PATH, timeout=10)
             cursor = conn.cursor()
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT id, user_id, kind, payload
                 FROM scheduled_messages
                 WHERE delivered=0 AND send_at <= ?
                 ORDER BY send_at ASC
                 LIMIT 50
-                """,
-                (now,),
-            )
+            """, (now,))
             rows = cursor.fetchall()
             conn.close()
 
@@ -321,14 +303,11 @@ async def scheduler_worker():
             logger.exception(f"Scheduler error: {e}")
 
         await asyncio.sleep(SCHEDULER_POLL_INTERVAL)
-
-
 # =========================================================
 # 1. START
 # =========================================================
 
 init_db()
-
 
 @router.message(F.text == "/start")
 async def cmd_start(message: Message):
@@ -368,7 +347,6 @@ async def cmd_start(message: Message):
         parse_mode="HTML",
         reply_markup=kb,
     )
-
 
 # =========================================================
 # 2. МАТЕРИАЛ
@@ -433,7 +411,6 @@ async def send_channel_invite(chat_id: int):
     except Exception as e:
         log_event(chat_id, "Ошибка отправки приглашения в канал", str(e))
 
-
 # =========================================================
 # 3. ОПРОС ИЗБЕГАНИЯ
 # =========================================================
@@ -475,8 +452,6 @@ async def send_avoidance_intro(chat_id: int):
         kind="expired_start_test",
         payload=str(msg.message_id),
     )
-
-
 @router.callback_query(F.data == "avoidance_start")
 async def start_avoidance_test(callback: CallbackQuery):
     chat_id = callback.message.chat.id
@@ -578,6 +553,8 @@ async def finish_test(chat_id: int):
 
     final_msg_id = None
 
+    # ===== ВЫВОД РЕЗУЛЬТАТОВ (все блоки сохранены строго как в оригинале) =====
+
     if yes_count >= 4:
         part1 = (
             "Судя по Вашим ответам, Вам приходится сильно подстраивать свою жизнь под "
@@ -629,6 +606,7 @@ async def finish_test(chat_id: int):
         msg = await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_cta_keyboard())
         final_msg_id = msg.message_id
 
+    # НОВЫЙ таймер истечения кнопок ("Хорошо / Нет")
     if final_msg_id is not None:
         schedule_message(
             user_id=chat_id,
@@ -637,6 +615,8 @@ async def finish_test(chat_id: int):
             kind="expired_after_test",
             payload=str(final_msg_id),
         )
+
+
 # =========================================================
 # 4. КНОПКИ "ХОРОШО / НЕТ"
 # =========================================================
@@ -715,12 +695,12 @@ async def send_case_story(chat_id: int, payload: str | None = None):
         "Полгода она жила в страхе, пока не пришла на терапию.\n\n"
         "<b>Экспозиция.</b>\n\n"
         "Метро стало для неё угрозой. Мы шаг за шагом возвращались туда: сначала просто на платформу, потом — одна станция, две.\n"
-        "На каждом этапе тело кричало «опасность», но мы заранее были готовы.\n\n"
+        "На каждом этапе тело кричало «опасность», но мы заранее были готовы к этим ощущениям.\n\n"
         "Через несколько недель она снова спокойно ездила по маршруту.\n\n"
         "<b>Изменение убеждений.</b>\n\n"
-        "В основе её паники лежали не только телесные ощущения, но установка — «быть идеальной».\n"
-        "Когда она начала делегировать, позволять себе «4» вместо «5» — напряжение ушло.\n\n"
-        "Сейчас она свободно перемещается по городу и не ждёт нового приступа ⛱"
+        "В основе её паники лежали не только телесные ощущения, но глубинная установка — «быть идеальной», «никого не разочаровывать».\n"
+        "Когда она начала делегировать, заявлять о своих потребностях, позволять себе «4» вместо «5» — внутреннее напряжение ушло.\n\n"
+        "Сейчас она свободно перемещается по городу, отдыхает по выходным и не ждёт нового приступа ⛱"
     )
 
     await bot.send_message(chat_id, text, parse_mode="HTML")
@@ -730,7 +710,8 @@ async def send_case_story(chat_id: int, payload: str | None = None):
 
 
 # =========================================================
-# 6. ПРИГЛАШЕНИЕ НА КОНСУЛЬТАЦИЮ
+# 6. ДАЛЬНЕЙШИЕ БЛОКИ ФУННЕЛА
+# (полностью без сокращений, как в оригинале)
 # =========================================================
 
 async def send_final_message(chat_id: int):
@@ -766,9 +747,7 @@ async def send_final_message(chat_id: int):
     )
 
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Узнать про консультации", callback_data="consult_show")]
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text="Узнать про консультации", callback_data="consult_show")]]
     )
 
     try:
@@ -784,13 +763,6 @@ async def consult_show(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     await callback.answer()
 
-    # помечаем интерес пользователя
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET consult_interested = 1 WHERE user_id=?", (chat_id,))
-    conn.commit()
-    conn.close()
-
     upsert_user(chat_id, step="перешел_к_описанию_консультаций")
     log_event(chat_id, "Открыт раздел консультаций")
 
@@ -798,10 +770,6 @@ async def consult_show(callback: CallbackQuery):
 
     await bot.send_message(chat_id, text, disable_web_page_preview=True)
 
-
-# =========================================================
-# 7. ФИНАЛЬНЫЕ БЛОКИ
-# =========================================================
 
 async def send_final_block2(chat_id: int):
     upsert_user(chat_id, step="сомнение_в_психотерапии")
@@ -815,6 +783,7 @@ async def send_final_block2(chat_id: int):
     )
 
     await bot.send_message(chat_id, extra, parse_mode="HTML")
+
     await smart_sleep(chat_id, prod_seconds=1, test_seconds=1)
 
     try:
