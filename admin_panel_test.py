@@ -144,27 +144,29 @@ def get_users():
     return rows
 
 
-# ============================
-# ФИКС: определяем интерес по LIKE
-# ============================
+# =====================================================================
+# ✔ САМЫЙ НАДЁЖНЫЙ В МИРЕ СПОСОБ: анализируем содержимое action/details
+# =====================================================================
 
 def has_consult_interest(user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT 1 FROM events
+        SELECT action, details
+        FROM events
         WHERE user_id = ?
-          AND (
-                action LIKE '%консультац%' OR
-                details LIKE '%консультац%'
-              )
-        LIMIT 1
     """, (user_id,))
 
-    row = cursor.fetchone()
+    rows = cursor.fetchall()
     conn.close()
-    return bool(row)
+
+    for action, details in rows:
+        text = f"{action} {details}".lower()
+        if "консультац" in text:
+            return True
+
+    return False
 
 
 @app.get("/panel-database-test", response_class=HTMLResponse)
