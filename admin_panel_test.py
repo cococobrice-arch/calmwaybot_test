@@ -149,7 +149,11 @@ def has_consult_interest(user_id: int) -> bool:
     cursor = conn.cursor()
     cursor.execute("""
         SELECT 1 FROM events
-        WHERE user_id=? AND action='Открыт раздел консультаций'
+        WHERE user_id=?
+          AND action IN (
+            'Открыта информация о консультациях',
+            'Открыт раздел консультаций'
+          )
         LIMIT 1
     """, (user_id,))
     row = cursor.fetchone()
