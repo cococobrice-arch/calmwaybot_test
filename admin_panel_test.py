@@ -101,8 +101,7 @@ def ensure_schema():
             step TEXT,
             subscribed INTEGER DEFAULT 0,
             last_action TEXT,
-            username TEXT,
-            consult_interested INTEGER DEFAULT 0
+            username TEXT
         )
     """)
 
@@ -119,7 +118,9 @@ def ensure_schema():
     conn.commit()
     conn.close()
 
+
 ensure_schema()
+
 
 def fmt_time(ts: str) -> str:
     if not ts:
@@ -129,11 +130,12 @@ def fmt_time(ts: str) -> str:
     except:
         return ts
 
+
 def get_users():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT user_id, source, step, subscribed, consult_interested, last_action, username
+        SELECT user_id, source, step, subscribed, last_action, username
         FROM users
         ORDER BY last_action DESC
     """)
@@ -141,14 +143,28 @@ def get_users():
     conn.close()
     return rows
 
+
+def has_consult_interest(user_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 1 FROM events
+        WHERE user_id=? AND action='Открыт раздел консультаций'
+        LIMIT 1
+    """, (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row)
+
+
 @app.get("/panel-database-test", response_class=HTMLResponse)
 async def panel_main():
     users = get_users()
 
     rows_html = ""
-    for user_id, source, step, subscribed, consult_interested, last_action, username in users:
+    for user_id, source, step, subscribed, last_action, username in users:
         subscribed_mark = "✅" if subscribed else "—"
-        interest_mark = "✅" if consult_interested else "—"
+        consult_mark = "✅" if has_consult_interest(user_id) else "—"
         display_name = f"@{username}" if username else str(user_id)
         last_action_fmt = fmt_time(last_action)
 
@@ -158,7 +174,7 @@ async def panel_main():
             <td>{source}</td>
             <td>{step}</td>
             <td>{subscribed_mark}</td>
-            <td>{interest_mark}</td>
+            <td>{consult_mark}</td>
             <td>{last_action_fmt}</td>
             <td><a href="/panel-database-test/user/{user_id}"><button>История</button></a></td>
         </tr>
@@ -188,6 +204,7 @@ async def panel_main():
 
     return html
 
+
 @app.get("/panel-database-test/user/{user_id}", response_class=HTMLResponse)
 async def user_history(user_id: int):
     conn = sqlite3.connect(DB_PATH)
@@ -215,16 +232,13 @@ async def user_history(user_id: int):
     <a href="/panel-database-test">⬅ Назад</a>
 
     <table>
-        <tr>
-            <th>Время</th>
-            <th>Действие</th>
-            <th>Детали</th>
-        </tr>
+        <tr><th>Время</th><th>Действие</th><th>Детали</th></tr>
         {rows}
     </table>
     """
 
     return html
+
 
 if __name__ == "__main__":
     import uvicorn
