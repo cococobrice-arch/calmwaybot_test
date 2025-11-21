@@ -324,7 +324,7 @@ async def send_material(callback: CallbackQuery):
         log_event(chat_id, "Не удалось найти файл гайда", LINK or "Путь не задан")
 
     schedule_message(chat_id, prod_seconds=20 * 60, test_seconds=10, kind="channel_invite")
-    schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=10, kind="avoidance_intro")
+    schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=20, kind="avoidance_intro")
 
     await callback.answer()
 
