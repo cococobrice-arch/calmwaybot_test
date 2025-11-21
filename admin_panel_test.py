@@ -4,15 +4,12 @@ from datetime import datetime
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-
 DB_PATH = "/home/dmitry/calmwaybot_test/users_test.db"
 
 app = FastAPI(title="CalmWayBot TEST Admin Panel")
 
-
 STYLE = """
 <style>
-
 :root {
     --bg: #ffffff;
     --fg: #000000;
@@ -93,7 +90,6 @@ a {
 </style>
 """
 
-
 def ensure_schema():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -105,7 +101,8 @@ def ensure_schema():
             step TEXT,
             subscribed INTEGER DEFAULT 0,
             last_action TEXT,
-            username TEXT
+            username TEXT,
+            consult_interested INTEGER DEFAULT 0
         )
     """)
 
@@ -122,9 +119,7 @@ def ensure_schema():
     conn.commit()
     conn.close()
 
-
 ensure_schema()
-
 
 def fmt_time(ts: str) -> str:
     if not ts:
@@ -134,37 +129,26 @@ def fmt_time(ts: str) -> str:
     except:
         return ts
 
-
 def get_users():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, source, step, subscribed, last_action, username FROM users ORDER BY last_action DESC")
+    cursor.execute("""
+        SELECT user_id, source, step, subscribed, consult_interested, last_action, username
+        FROM users
+        ORDER BY last_action DESC
+    """)
     rows = cursor.fetchall()
     conn.close()
     return rows
-
-
-def has_consult_interest(user_id: int) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT 1 FROM events
-        WHERE user_id=? AND action='Открыт раздел консультаций'
-        LIMIT 1
-    """, (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return bool(row)
-
 
 @app.get("/panel-database-test", response_class=HTMLResponse)
 async def panel_main():
     users = get_users()
 
     rows_html = ""
-    for user_id, source, step, subscribed, last_action, username in users:
-        status = "✅" if subscribed else "—"
-        consult = "✅" if has_consult_interest(user_id) else "—"
+    for user_id, source, step, subscribed, consult_interested, last_action, username in users:
+        subscribed_mark = "✅" if subscribed else "—"
+        interest_mark = "✅" if consult_interested else "—"
         display_name = f"@{username}" if username else str(user_id)
         last_action_fmt = fmt_time(last_action)
 
@@ -173,8 +157,8 @@ async def panel_main():
             <td>{display_name}</td>
             <td>{source}</td>
             <td>{step}</td>
-            <td>{status}</td>
-            <td>{consult}</td>
+            <td>{subscribed_mark}</td>
+            <td>{interest_mark}</td>
             <td>{last_action_fmt}</td>
             <td><a href="/panel-database-test/user/{user_id}"><button>История</button></a></td>
         </tr>
@@ -203,7 +187,6 @@ async def panel_main():
     """
 
     return html
-
 
 @app.get("/panel-database-test/user/{user_id}", response_class=HTMLResponse)
 async def user_history(user_id: int):
@@ -242,7 +225,6 @@ async def user_history(user_id: int):
     """
 
     return html
-
 
 if __name__ == "__main__":
     import uvicorn
