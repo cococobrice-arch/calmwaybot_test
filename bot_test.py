@@ -35,7 +35,7 @@ SCHEDULER_POLL_INTERVAL = int(os.getenv("SCHEDULER_POLL_INTERVAL", "10"))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
-dp.include_router(router)
+dp.include_router(router]
 
 
 # =========================================================
@@ -105,6 +105,19 @@ def log_event(user_id: int, action: str, details: str | None = None):
     conn.close()
 
 
+def reset_user_state(user_id: int):
+    """Сбрасываем состояние пользователя, но НЕ трогаем историю (events)."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+    cursor.execute("DELETE FROM answers WHERE user_id=?", (user_id,))
+    cursor.execute("DELETE FROM scheduled_messages WHERE user_id=?", (user_id,))
+
+    conn.commit()
+    conn.close()
+
+
 def upsert_user(user_id: int, step: str | None = None, subscribed: int | None = None, username: str | None = None):
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
@@ -136,116 +149,6 @@ def upsert_user(user_id: int, step: str | None = None, subscribed: int | None = 
     conn.close()
 
 
-def purge_user(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM events WHERE user_id=?", (user_id,))
-    cursor.execute("DELETE FROM answers WHERE user_id=?", (user_id,))
-    cursor.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-    cursor.execute("DELETE FROM scheduled_messages WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def is_fast_user(user_id: int) -> bool:
-    if MODE == "test":
-        return True
-    return FAST_USER_ID is not None and user_id == FAST_USER_ID
-
-
-async def smart_sleep(user_id: int, prod_seconds: int, test_seconds: int = 3):
-    delay = test_seconds if is_fast_user(user_id) else prod_seconds
-    await asyncio.sleep(delay)
-
-
-def schedule_message(
-    user_id: int,
-    prod_seconds: int,
-    kind: str,
-    payload: str | None = None,
-    test_seconds: int = 3,
-):
-    delay = test_seconds if is_fast_user(user_id) else prod_seconds
-    send_at = datetime.now() + timedelta(seconds=delay)
-
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    cursor = conn.cursor()
-
-    cursor.execute("DELETE FROM scheduled_messages WHERE user_id=? AND kind=? AND delivered=0", (user_id, kind))
-
-    cursor.execute(
-        "INSERT INTO scheduled_messages (user_id, send_at, kind, payload) VALUES (?, ?, ?, ?)",
-        (user_id, send_at.isoformat(timespec="seconds"), kind, payload),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def mark_message_delivered(task_id: int):
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE scheduled_messages SET delivered=1 WHERE id=?", (task_id,))
-    conn.commit()
-    conn.close()
-
-
-async def process_scheduled_message(task_id: int, user_id: int, kind: str, payload: str | None):
-    try:
-        if kind == "channel_invite":
-            await send_channel_invite(user_id)
-        elif kind == "avoidance_intro":
-            await send_avoidance_intro(user_id)
-        elif kind == "case_story":
-            await send_case_story(user_id, payload)
-        elif kind == "case_story_auto":
-            await send_case_story(user_id, payload)
-        elif kind == "final_block1":
-            await send_final_message(user_id)
-        elif kind == "final_block2":
-            await send_final_block2(user_id)
-        elif kind == "final_block3":
-            await send_final_block3(user_id)
-        elif kind == "chat_invite":
-            await send_chat_invite(user_id)
-        else:
-            log_event(user_id, "Неизвестный тип отложенного сообщения", kind)
-    finally:
-        mark_message_delivered(task_id)
-
-
-async def scheduler_worker():
-    logger.info("Scheduler запущен")
-    while True:
-        try:
-            now = datetime.now().isoformat(timespec="seconds")
-            conn = sqlite3.connect(DB_PATH, timeout=10)
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id, user_id, kind, payload
-                FROM scheduled_messages
-                WHERE delivered=0 AND send_at <= ?
-                ORDER BY send_at ASC
-                LIMIT 50
-            """, (now,))
-            rows = cursor.fetchall()
-            conn.close()
-
-            if not rows:
-                await asyncio.sleep(SCHEDULER_POLL_INTERVAL)
-                continue
-
-            for task_id, user_id, kind, payload in rows:
-                await process_scheduled_message(task_id, user_id, kind, payload)
-
-        except Exception as e:
-            logger.exception(f"Scheduler error: {e}")
-
-        await asyncio.sleep(SCHEDULER_POLL_INTERVAL)
-
-
-init_db()
-
 
 # =========================================================
 # 1. START
@@ -256,6 +159,11 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     username = (message.from_user.username or "").strip() or None
 
+    # --- ПОЛНЫЙ СБРОС СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЯ ---
+    reset_user_state(user_id)
+    log_event(user_id, "Сброс состояния", "Пользователь начал всё заново")
+    # --------------------------------------------
+
     # ---- ОПРЕДЕЛЯЕМ ИСТОЧНИК ----
     source = "unknown"
     parts = message.text.split(" ", 1)
@@ -265,35 +173,20 @@ async def cmd_start(message: Message):
             source = "telegram-channel"
     # ------------------------------
 
-    TEST_USER_ID = int(os.getenv("FAST_USER_ID", "0") or 0)
-    if user_id == TEST_USER_ID:
-        purge_user(user_id)
-        log_event(user_id, "Очистка тестового пользователя")
-
-    # ---- ЗАПИСЫВАЕМ ИСТОЧНИК В БАЗУ ----
+    # ---- ЗАПИСЫВАЕМ СВЕЖЕГО ПОЛЬЗОВАТЕЛЯ ----
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
 
-    cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-    exists = cursor.fetchone()
-
     now = datetime.now().isoformat(timespec="seconds")
-
-    if exists:
-        cursor.execute(
-            "UPDATE users SET step=?, username=?, source=?, last_action=? WHERE user_id=?",
-            ("старт", username, source, now, user_id)
-        )
-    else:
-        cursor.execute(
-            "INSERT INTO users (user_id, source, step, subscribed, last_action, username) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, source, "старт", 0, now, username)
-        )
+    cursor.execute(
+        "INSERT INTO users (user_id, source, step, subscribed, last_action, username) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, source, "старт", 0, now, username)
+    )
 
     conn.commit()
     conn.close()
-    # ------------------------------------
+    # -----------------------------------------
 
     log_event(user_id, "Запуск бота", f"source={source}")
 
