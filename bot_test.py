@@ -347,6 +347,8 @@ async def send_material(callback: CallbackQuery):
     upsert_user(chat_id, step="получил_гайд", username=username)
     log_event(chat_id, "Нажата кнопка «Получить гайд»", "Начало выдачи материала")
 
+    sent_pdf = None
+
     if VIDEO_NOTE_FILE_ID:
         try:
             await bot.send_chat_action(chat_id, "upload_video_note")
@@ -357,19 +359,40 @@ async def send_material(callback: CallbackQuery):
 
     if LINK and os.path.exists(LINK):
         file = FSInputFile(LINK, filename="Выход из панического круга.pdf")
-        await bot.send_document(chat_id, document=file, caption="Вот Ваш первый шаг к спокойствию 🧘🏻‍♀️")
+        sent_pdf = await bot.send_document(
+            chat_id,
+            document=file,
+            caption="Вот Ваш первый шаг к спокойствию 🧘🏻‍♀️"
+        )
         log_event(chat_id, "Отправлен файл с гайдом", "Гайд отправлен как документ")
     elif LINK and LINK.startswith("http"):
-        await bot.send_message(chat_id, f"📘 Ваш материал доступен по ссылке: {LINK}")
+        sent_pdf = await bot.send_message(chat_id, f"📘 Ваш материал доступен по ссылке: {LINK}")
         log_event(chat_id, "Отправлена ссылка на гайд", LINK)
     else:
-        await bot.send_message(chat_id, "⚠️ Файл не найден.")
+        sent_pdf = await bot.send_message(chat_id, "⚠️ Файл не найден.")
         log_event(chat_id, "Не удалось найти файл гайда", LINK or "Путь не задан")
 
-    schedule_message(chat_id, prod_seconds=2 * 60 * 60, test_seconds=10, kind="channel_invite")
-    schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=20, kind="avoidance_intro")
+    # ⚠️ КРИТИЧНО — передать payload=message_id
+    payload_value = str(sent_pdf.message_id) if sent_pdf else "0"
+
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=2 * 60 * 60,
+        test_seconds=10,
+        kind="channel_invite",
+        payload=payload_value
+    )
+
+    schedule_message(
+        user_id=chat_id,
+        prod_seconds=24 * 60 * 60,
+        test_seconds=20,
+        kind="avoidance_intro",
+        payload="0"
+    )
 
     await callback.answer()
+
 
 
 async def send_channel_invite(chat_id: int):
