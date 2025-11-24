@@ -251,51 +251,19 @@ init_db()
 # 1. START
 # =========================================================
 
-@router.message(F.text.startswith("/start"))
+@router.message(F.text == "/start")
 async def cmd_start(message: Message):
     user_id = message.from_user.id
     username = (message.from_user.username or "").strip() or None
 
-    # ---- ОПРЕДЕЛЯЕМ ИСТОЧНИК ----
-    source = "unknown"
-    parts = message.text.split(" ", 1)
-    if len(parts) > 1:
-        param = parts[1].strip()
-        if param == "channel":
-            source = "telegram-channel"
-    # ------------------------------
-
     TEST_USER_ID = int(os.getenv("FAST_USER_ID", "0") or 0)
+
     if user_id == TEST_USER_ID:
         purge_user(user_id)
-        log_event(user_id, "Очистка тестового пользователя")
+        log_event(user_id, "Очистка данных тестового пользователя", "Данные тестового пользователя очищены при старте")
 
-    # ---- ЗАПИСЫВАЕМ ИСТОЧНИК В БАЗУ ----
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-    exists = cursor.fetchone()
-
-    now = datetime.now().isoformat(timespec="seconds")
-
-    if exists:
-        cursor.execute(
-            "UPDATE users SET step=?, username=?, source=?, last_action=? WHERE user_id=?",
-            ("старт", username, source, now, user_id)
-        )
-    else:
-        cursor.execute(
-            "INSERT INTO users (user_id, source, step, subscribed, last_action, username) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, source, "старт", 0, now, username)
-        )
-
-    conn.commit()
-    conn.close()
-    # ------------------------------------
-
-    log_event(user_id, "Запуск бота", f"source={source}")
+    upsert_user(user_id, step="старт", username=username)
+    log_event(user_id, "Запуск бота", "Команда /start")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
