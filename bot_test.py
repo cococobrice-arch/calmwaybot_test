@@ -542,7 +542,30 @@ async def start_avoidance_test(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     await callback.answer()
 
-    # Пользователь начал тест - отменяем автопереход к истории пациентки
+    # ---- ПРОВЕРКА: НЕ НАЧИНАЛ ЛИ ПОЛЬЗОВАТЕЛЬ ТЕСТ РАНЬШЕ ----
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+    cursor.execute("SELECT step FROM users WHERE user_id=?", (chat_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    # Если пользователь уже проходил тест, повторно запускать нельзя
+    if row and row[0] not in ("предложен_тест_избегания", "тест_избегания_начат"):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        await callback.answer("Вы уже проходили этот тест.")
+        return
+
+    # ---- УДАЛЯЕМ КЛАВИАТУРУ "Начать тест" ----
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    # ---- УДАЛЯЕМ АВТОЗАДАЧУ перехода к истории пациентки ----
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
     cursor.execute(
@@ -552,17 +575,21 @@ async def start_avoidance_test(callback: CallbackQuery):
     conn.commit()
     conn.close()
 
+    # ---- СБРАСЫВАЕМ ПРЕДЫДУЩИЕ ОТВЕТЫ (ЕСЛИ ЕСТЬ) ----
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM answers WHERE user_id=?", (chat_id,))
     conn.commit()
     conn.close()
 
+    # ---- УСТАНАВЛИВАЕМ НОВЫЙ ШАГ ----
     upsert_user(chat_id, step="тест_избегания_начат")
     log_event(chat_id, "Начат тест избегания", "Нажата кнопка «Начать тест»")
 
+    # ---- ПЕРВОЕ СООБЩЕНИЕ ТЕСТА ----
     await bot.send_message(chat_id, "Итак, начнём:")
     await send_question(chat_id, 0)
+
 
 
 async def send_question(chat_id: int, index: int):
