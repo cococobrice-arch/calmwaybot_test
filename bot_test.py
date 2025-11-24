@@ -397,9 +397,36 @@ async def send_material(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     username = callback.from_user.username or None
 
+    # ---- ПРОВЕРКА: ПОЛЬЗОВАТЕЛЬ УЖЕ ПОЛУЧАЛ МАТЕРИАЛ ----
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+    cursor.execute("SELECT step FROM users WHERE user_id=?", (chat_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if row and row[0] != "старт":
+        # Убираем клавиатуру, если она вдруг осталась
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        await callback.answer("Материал уже был выдан ранее.")
+        return
+    # -----------------------------------------------------
+
+    # ---- УБИРАЕМ КЛАВИАТУРУ ПОСЛЕ НАЖАТИЯ ----
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    # -----------------------------------------------------
+
+    # ---- ОБНОВЛЯЕМ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ ----
     upsert_user(chat_id, step="получил_гайд", username=username)
     log_event(chat_id, "Нажата кнопка «Получить гайд»", "Начало выдачи материала")
 
+    # ---- ОТПРАВКА ПРИВЕТСТВЕННОГО КРУЖКА ----
     if VIDEO_NOTE_FILE_ID:
         try:
             await bot.send_chat_action(chat_id, "upload_video_note")
@@ -408,21 +435,26 @@ async def send_material(callback: CallbackQuery):
             logger.warning(f"Ошибка отправки кружка: {e}")
             log_event(chat_id, "Ошибка отправки приветственного видео", str(e))
 
+    # ---- ОТПРАВКА PDF ----
     if LINK and os.path.exists(LINK):
         file = FSInputFile(LINK, filename="Выход из панического круга.pdf")
         await bot.send_document(chat_id, document=file, caption="Вот Ваш первый шаг к спокойствию 🧘🏻‍♀️")
         log_event(chat_id, "Отправлен файл с гайдом", "Гайд отправлен как документ")
+
     elif LINK and LINK.startswith("http"):
         await bot.send_message(chat_id, f"📘 Ваш материал доступен по ссылке: {LINK}")
         log_event(chat_id, "Отправлена ссылка на гайд", LINK)
+
     else:
         await bot.send_message(chat_id, "⚠️ Файл не найден.")
         log_event(chat_id, "Не удалось найти файл гайда", LINK or "Путь не задан")
 
+    # ---- ПЛАНИРУЕМ СООБЩЕНИЯ ДАЛЬШЕ ----
     schedule_message(chat_id, prod_seconds=2 * 60 * 60, test_seconds=10, kind="channel_invite")
     schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=20, kind="avoidance_intro")
 
     await callback.answer()
+
 
 
 async def send_channel_invite(chat_id: int):
