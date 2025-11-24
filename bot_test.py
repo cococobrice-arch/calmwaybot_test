@@ -441,6 +441,18 @@ async def send_channel_invite(chat_id: int):
     except Exception as e:
         log_event(chat_id, "Ошибка отправки приглашения в канал", str(e))
 
+    # 🔥 ВОТ ЭТО — КРИТИЧЕСКАЯ ЧАСТЬ, КОТОРОЙ У ТЕБЯ СЕЙЧАС НЕТ:
+    try:
+        member = await bot.get_chat_member(CHANNEL_USERNAME.lstrip("@"), chat_id)
+        is_sub = 1 if member.status in ("member", "administrator", "creator") else 0
+    except Exception as e:
+        log_event(chat_id, "Ошибка проверки подписки", str(e))
+        is_sub = 0
+
+    upsert_user(chat_id, subscribed=is_sub)
+    log_event(chat_id, "Проверка подписки", f"subscribed={is_sub}")
+
+
 
 # =========================================================
 # 3. ОПРОС ИЗБЕГАНИЯ
