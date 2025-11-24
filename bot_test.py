@@ -248,8 +248,19 @@ init_db()
 
 
 # =========================================================
-# 1. START
+# 1. START (с полной очисткой состояния, но без удаления логов)
 # =========================================================
+
+def reset_user_state(user_id: int):
+    """Сбрасывает состояние пользователя, НЕ трогая events."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM answers WHERE user_id=?", (user_id,))
+    cursor.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+    cursor.execute("DELETE FROM scheduled_messages WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
 
 @router.message(F.text.startswith("/start"))
 async def cmd_start(message: Message):
@@ -265,35 +276,35 @@ async def cmd_start(message: Message):
             source = "telegram-channel"
     # ------------------------------
 
-    TEST_USER_ID = int(os.getenv("FAST_USER_ID", "0") or 0)
-    if user_id == TEST_USER_ID:
-        purge_user(user_id)
-        log_event(user_id, "Очистка тестового пользователя")
+    # ---- ГРУППОВОЙ СБРОС ТЕСТОВЫХ ЮЗЕРОВ ----
+    purge_flag = os.getenv("PURGE_TEST_USERS_ON_START", "false").lower() == "true"
+    raw_list = os.getenv("TEST_USER_IDS", "")
+    test_ids = []
+    if raw_list.strip():
+        test_ids = [int(x) for x in raw_list.split(",") if x.strip().isdigit()]
 
-    # ---- ЗАПИСЫВАЕМ ИСТОЧНИК В БАЗУ ----
+    if purge_flag and user_id in test_ids:
+        # Полный purge: включает удаление events
+        purge_user(user_id)
+        log_event(user_id, "Очистка тестового пользователя", "PURGE_TEST_USERS_ON_START=true")
+    else:
+        # У всех остальных пользователей чистим только состояние
+        reset_user_state(user_id)
+        log_event(user_id, "Сброс состояния", "Пользователь начал сценарий заново")
+
+    # ---- СОЗДАЕМ НОВУЮ ЗАПИСЬ В users ----
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
-
-    cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-    exists = cursor.fetchone()
-
     now = datetime.now().isoformat(timespec="seconds")
 
-    if exists:
-        cursor.execute(
-            "UPDATE users SET step=?, username=?, source=?, last_action=? WHERE user_id=?",
-            ("старт", username, source, now, user_id)
-        )
-    else:
-        cursor.execute(
-            "INSERT INTO users (user_id, source, step, subscribed, last_action, username) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, source, "старт", 0, now, username)
-        )
+    cursor.execute(
+        "INSERT INTO users (user_id, source, step, subscribed, last_action, username) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, source, "старт", 0, now, username)
+    )
 
     conn.commit()
     conn.close()
-    # ------------------------------------
 
     log_event(user_id, "Запуск бота", f"source={source}")
 
