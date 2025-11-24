@@ -252,12 +252,11 @@ init_db()
 # =========================================================
 
 def reset_user_state(user_id: int):
-    """Сбрасывает состояние пользователя, НЕ трогая events."""
+    """Сбрасывает состояние пользователя, НЕ трогая events и scheduled_messages."""
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM answers WHERE user_id=?", (user_id,))
-    cursor.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-    cursor.execute("DELETE FROM scheduled_messages WHERE user_id=?", (user_id,))
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+    cur.execute("DELETE FROM answers WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -267,47 +266,48 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     username = (message.from_user.username or "").strip() or None
 
-    # ---- ОПРЕДЕЛЯЕМ ИСТОЧНИК ----
+    # ---- Определяем источник ----
     source = "unknown"
     parts = message.text.split(" ", 1)
     if len(parts) > 1:
         param = parts[1].strip()
         if param == "channel":
             source = "telegram-channel"
-    # ------------------------------
 
-    # ---- ГРУППОВОЙ СБРОС ТЕСТОВЫХ ЮЗЕРОВ ----
+    # ---- СБРОС СОСТОЯНИЯ ДЛЯ ЛЮБОГО ПОЛЬЗОВАТЕЛЯ (кроме полного purge) ----
+
+    # Флаги тестовых purge — если ты ими пользуешься
     purge_flag = os.getenv("PURGE_TEST_USERS_ON_START", "false").lower() == "true"
     raw_list = os.getenv("TEST_USER_IDS", "")
     test_ids = []
     if raw_list.strip():
         test_ids = [int(x) for x in raw_list.split(",") if x.strip().isdigit()]
 
+    # Если включён purge и это тестовый юзер — удаляем ВСЁ (включая events)
     if purge_flag and user_id in test_ids:
-        # Полный purge: включает удаление events
         purge_user(user_id)
-        log_event(user_id, "Очистка тестового пользователя", "PURGE_TEST_USERS_ON_START=true")
+        log_event(user_id, "Полная очистка тестового пользователя")
     else:
-        # У всех остальных пользователей чистим только состояние
+        # Для всех остальных — мягкий сброс состояния БЕЗ сброса задач
         reset_user_state(user_id)
-        log_event(user_id, "Сброс состояния", "Пользователь начал сценарий заново")
+        log_event(user_id, "Сброс состояния", "Пользователь начал путь заново")
 
-    # ---- СОЗДАЕМ НОВУЮ ЗАПИСЬ В users ----
+    # ---- Создаём новую запись в users ----
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    cursor = conn.cursor()
+    cur = conn.cursor()
     now = datetime.now().isoformat(timespec="seconds")
 
-    cursor.execute(
+    cur.execute(
         "INSERT INTO users (user_id, source, step, subscribed, last_action, username) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, source, "старт", 0, now, username)
+        (user_id, source, 'старт', 0, now, username)
     )
 
     conn.commit()
     conn.close()
-
     log_event(user_id, "Запуск бота", f"source={source}")
 
+    # ---- Кнопка ----
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📘 Получить гайд", callback_data="get_material")]
