@@ -190,25 +190,10 @@ def mark_message_delivered(task_id: int):
     conn.close()
 
 
-async def update_subscription_status(user_id: int) -> int:
-    try:
-        member = await bot.get_chat_member(CHANNEL_USERNAME.lstrip("@"), user_id)
-        is_sub = 1 if member.status in ("member", "administrator", "creator") else 0
-    except Exception as e:
-        log_event(user_id, "Ошибка проверки подписки", str(e))
-        is_sub = 0
-
-    upsert_user(user_id, subscribed=is_sub)
-    log_event(user_id, "Проверка подписки", f"subscribed={is_sub}")
-    return is_sub
-
-
 async def process_scheduled_message(task_id: int, user_id: int, kind: str, payload: str | None):
     try:
         if kind == "channel_invite":
-            is_sub = await update_subscription_status(user_id)
-            if not is_sub:
-                await send_channel_invite(user_id)
+            await send_channel_invite(user_id)
         elif kind == "avoidance_intro":
             await send_avoidance_intro(user_id)
         elif kind == "case_story":
@@ -263,66 +248,55 @@ init_db()
 
 
 # =========================================================
-# 1. START (с полной очисткой состояния, но без удаления логов)
+# 1. START
 # =========================================================
-
-def reset_user_state(user_id: int):
-    """Сбрасывает состояние пользователя, НЕ трогая events и scheduled_messages."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-    cur.execute("DELETE FROM answers WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
-
 
 @router.message(F.text.startswith("/start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
     username = (message.from_user.username or "").strip() or None
 
-    # ---- Определяем источник ----
+    # ---- ОПРЕДЕЛЯЕМ ИСТОЧНИК ----
     source = "unknown"
     parts = message.text.split(" ", 1)
     if len(parts) > 1:
         param = parts[1].strip()
         if param == "channel":
             source = "telegram-channel"
+    # ------------------------------
 
-    # ---- СБРОС СОСТОЯНИЯ ДЛЯ ЛЮБОГО ПОЛЬЗОВАТЕЛЯ (кроме полного purge) ----
-
-    # Флаги тестовых purge — если ты ими пользуешься
-    purge_flag = os.getenv("PURGE_TEST_USERS_ON_START", "false").lower() == "true"
-    raw_list = os.getenv("TEST_USER_IDS", "")
-    test_ids = []
-    if raw_list.strip():
-        test_ids = [int(x) for x in raw_list.split(",") if x.strip().isdigit()]
-
-    # Если включён purge и это тестовый юзер — удаляем ВСЁ (включая events)
-    if purge_flag and user_id in test_ids:
+    TEST_USER_ID = int(os.getenv("FAST_USER_ID", "0") or 0)
+    if user_id == TEST_USER_ID:
         purge_user(user_id)
-        log_event(user_id, "Полная очистка тестового пользователя")
-    else:
-        # Для всех остальных — мягкий сброс состояния БЕЗ сброса задач
-        reset_user_state(user_id)
-        log_event(user_id, "Сброс состояния", "Пользователь начал путь заново")
+        log_event(user_id, "Очистка тестового пользователя")
 
-    # ---- Создаём новую запись в users ----
+    # ---- ЗАПИСЫВАЕМ ИСТОЧНИК В БАЗУ ----
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    cur = conn.cursor()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    exists = cursor.fetchone()
+
     now = datetime.now().isoformat(timespec="seconds")
 
-    cur.execute(
-        "INSERT INTO users (user_id, source, step, subscribed, last_action, username) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, source, 'старт', 0, now, username)
-    )
+    if exists:
+        cursor.execute(
+            "UPDATE users SET step=?, username=?, source=?, last_action=? WHERE user_id=?",
+            ("старт", username, source, now, user_id)
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO users (user_id, source, step, subscribed, last_action, username) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, source, "старт", 0, now, username)
+        )
 
     conn.commit()
     conn.close()
+    # ------------------------------------
+
     log_event(user_id, "Запуск бота", f"source={source}")
 
-    # ---- Кнопка ----
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📘 Получить гайд", callback_data="get_material")]
@@ -362,8 +336,6 @@ async def send_material(callback: CallbackQuery):
     upsert_user(chat_id, step="получил_гайд", username=username)
     log_event(chat_id, "Нажата кнопка «Получить гайд»", "Начало выдачи материала")
 
-    sent_pdf = None
-
     if VIDEO_NOTE_FILE_ID:
         try:
             await bot.send_chat_action(chat_id, "upload_video_note")
@@ -374,36 +346,17 @@ async def send_material(callback: CallbackQuery):
 
     if LINK and os.path.exists(LINK):
         file = FSInputFile(LINK, filename="Выход из панического круга.pdf")
-        sent_pdf = await bot.send_document(
-            chat_id,
-            document=file,
-            caption="Вот Ваш первый шаг к спокойствию 🧘🏻‍♀️"
-        )
+        await bot.send_document(chat_id, document=file, caption="Вот Ваш первый шаг к спокойствию 🧘🏻‍♀️")
         log_event(chat_id, "Отправлен файл с гайдом", "Гайд отправлен как документ")
     elif LINK and LINK.startswith("http"):
-        sent_pdf = await bot.send_message(chat_id, f"📘 Ваш материал доступен по ссылке: {LINK}")
+        await bot.send_message(chat_id, f"📘 Ваш материал доступен по ссылке: {LINK}")
         log_event(chat_id, "Отправлена ссылка на гайд", LINK)
     else:
-        sent_pdf = await bot.send_message(chat_id, "⚠️ Файл не найден.")
+        await bot.send_message(chat_id, "⚠️ Файл не найден.")
         log_event(chat_id, "Не удалось найти файл гайда", LINK or "Путь не задан")
 
-    payload_value = str(sent_pdf.message_id) if sent_pdf else "0"
-
-    schedule_message(
-        user_id=chat_id,
-        prod_seconds=2 * 60 * 60,
-        test_seconds=10,
-        kind="channel_invite",
-        payload=payload_value
-    )
-
-    schedule_message(
-        user_id=chat_id,
-        prod_seconds=24 * 60 * 60,
-        test_seconds=20,
-        kind="avoidance_intro",
-        payload="0"
-    )
+    schedule_message(chat_id, prod_seconds=2 * 60 * 60, test_seconds=10, kind="channel_invite")
+    schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=20, kind="avoidance_intro")
 
     await callback.answer()
 
@@ -441,18 +394,6 @@ async def send_channel_invite(chat_id: int):
     except Exception as e:
         log_event(chat_id, "Ошибка отправки приглашения в канал", str(e))
 
-    # 🔥 ВОТ ЭТО — КРИТИЧЕСКАЯ ЧАСТЬ, КОТОРОЙ У ТЕБЯ СЕЙЧАС НЕТ:
-    try:
-        member = await bot.get_chat_member(CHANNEL_USERNAME.lstrip("@"), chat_id)
-        is_sub = 1 if member.status in ("member", "administrator", "creator") else 0
-    except Exception as e:
-        log_event(chat_id, "Ошибка проверки подписки", str(e))
-        is_sub = 0
-
-    upsert_user(chat_id, subscribed=is_sub)
-    log_event(chat_id, "Проверка подписки", f"subscribed={is_sub}")
-
-
 
 # =========================================================
 # 3. ОПРОС ИЗБЕГАНИЯ
@@ -483,6 +424,7 @@ async def send_avoidance_intro(chat_id: int):
     msg = await bot.send_message(chat_id, text, reply_markup=kb)
     log_event(chat_id, "Показан блок с предложением теста", "Предложен опрос избегания")
 
+    # Если пользователь не нажал кнопку - через сутки / 30 секунд тестовый
     schedule_message(
         user_id=chat_id,
         prod_seconds=24 * 60 * 60,
@@ -497,6 +439,7 @@ async def start_avoidance_test(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     await callback.answer()
 
+    # Пользователь начал тест - отменяем автопереход к истории пациентки
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
     cursor.execute(
