@@ -35,7 +35,7 @@ SCHEDULER_POLL_INTERVAL = int(os.getenv("SCHEDULER_POLL_INTERVAL", "10"))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
-dp.include_router(router]
+dp.include_router(router)
 
 
 # =========================================================
