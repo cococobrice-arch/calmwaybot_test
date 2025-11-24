@@ -136,13 +136,21 @@ def upsert_user(user_id: int, step: str | None = None, subscribed: int | None = 
     conn.close()
 
 
-def purge_user(user_id: int):
+def purge_user(user_id: int, keep_events: bool = False):
+    """
+    Удаляет состояние пользователя (users, answers, scheduled_messages).
+    Если keep_events=True, события в таблице events сохраняются.
+    """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM events WHERE user_id=?", (user_id,))
+
+    if not keep_events:
+        cursor.execute("DELETE FROM events WHERE user_id=?", (user_id,))
+
     cursor.execute("DELETE FROM answers WHERE user_id=?", (user_id,))
     cursor.execute("DELETE FROM users WHERE user_id=?", (user_id,))
     cursor.execute("DELETE FROM scheduled_messages WHERE user_id=?", (user_id,))
+
     conn.commit()
     conn.close()
 
@@ -248,22 +256,78 @@ init_db()
 
 
 # =========================================================
+# ВСПОМОГАТЕЛЬНОЕ: ПРОВЕРКА ПОДПИСКИ НА КАНАЛ
+# =========================================================
+
+async def is_user_subscribed_to_channel(user_id: int) -> bool:
+    """
+    Возвращает True, если пользователь уже состоит в канале, и False во всех остальных случаях.
+    """
+    try:
+        member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except TelegramBadRequest:
+        # пользователь не найден в канале / бот не видит его как участника
+        return False
+    except Exception as e:
+        logger.exception(f"Ошибка проверки подписки пользователя {user_id}: {e}")
+        return False
+
+
+# =========================================================
 # 1. START
 # =========================================================
 
-@router.message(F.text == "/start")
+@router.message(F.text.startswith("/start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
     username = (message.from_user.username or "").strip() or None
 
+    # ---- ОПРЕДЕЛЯЕМ ИСТОЧНИК ----
+    source = "unknown"
+    parts = message.text.split(" ", 1)
+    if len(parts) > 1:
+        param = parts[1].strip()
+        if param == "channel":
+            source = "telegram-channel"
+    # ------------------------------
+
     TEST_USER_ID = int(os.getenv("FAST_USER_ID", "0") or 0)
 
+    # Для тестового пользователя полностью очищаем всё, включая events,
+    # для остальных - сбрасываем состояние, но сохраняем логи.
     if user_id == TEST_USER_ID:
-        purge_user(user_id)
-        log_event(user_id, "Очистка данных тестового пользователя", "Данные тестового пользователя очищены при старте")
+        purge_user(user_id, keep_events=False)
+        log_event(user_id, "Очистка тестового пользователя")
+    else:
+        purge_user(user_id, keep_events=True)
 
-    upsert_user(user_id, step="старт", username=username)
-    log_event(user_id, "Запуск бота", "Команда /start")
+    # ---- ЗАПИСЫВАЕМ ИСТОЧНИК В БАЗУ ----
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    exists = cursor.fetchone()
+
+    now = datetime.now().isoformat(timespec="seconds")
+
+    if exists:
+        cursor.execute(
+            "UPDATE users SET step=?, username=?, source=?, last_action=? WHERE user_id=?",
+            ("старт", username, source, now, user_id)
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO users (user_id, source, step, subscribed, last_action, username) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, source, "старт", 0, now, username)
+        )
+
+    conn.commit()
+    conn.close()
+    # ------------------------------------
+
+    log_event(user_id, "Запуск бота", f"source={source}")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -330,7 +394,14 @@ async def send_material(callback: CallbackQuery):
 
 
 async def send_channel_invite(chat_id: int):
-    upsert_user(chat_id, step="приглашение_в_канал")
+    # Проверяем, подписан ли пользователь на канал
+    subscribed_now = await is_user_subscribed_to_channel(chat_id)
+    if subscribed_now:
+        upsert_user(chat_id, step="приглашение_в_канал", subscribed=1)
+        log_event(chat_id, "Пользователь уже состоит в канале, приглашение не отправлено", None)
+        return
+
+    upsert_user(chat_id, step="приглашение_в_канал", subscribed=0)
 
     text = (
         "У меня есть телеграм-канал, где я делюсь нюансами об эффективных способах преодоления тревоги "
@@ -499,7 +570,6 @@ async def finish_test(chat_id: int):
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
     cursor.execute("SELECT answer FROM answers WHERE user_id=?", (chat_id,))
-
 
     answers = [row[0] for row in cursor.fetchall()]
     conn.close()
@@ -735,9 +805,9 @@ async def send_final_message(chat_id: int):
 
     try:
         await bot.send_photo(chat_id, photo=photo, caption=caption, parse_mode="HTML")
-        log_event(chat_id, "Отправлено сообщение с приглашением на консультацию (фото)", None)
+        log_event(chat_id, "Отправлено сообщение с описанием формата работы (фото)", None)
     except Exception as e:
-        log_event(chat_id, "Ошибка отправки блока «приглашение на консультацию» (фото)", str(e))
+        log_event(chat_id, "Ошибка отправки блока с описанием формата работы (фото)", str(e))
 
     await smart_sleep(chat_id, prod_seconds=60, test_seconds=3)
 
@@ -762,9 +832,9 @@ async def send_final_message(chat_id: int):
 
     try:
         await bot.send_message(chat_id, text2, parse_mode="HTML", reply_markup=kb)
-        log_event(chat_id, "Отправлено текстовое приглашение на консультацию", None)
+        log_event(chat_id, "Отправлен текстовый блок с описанием формата работы", None)
     except Exception as e:
-        log_event(chat_id, "Ошибка отправки текстового блока «приглашение на консультацию»", str(e))
+        log_event(chat_id, "Ошибка отправки текстового блока с описанием формата работы", str(e))
 
     schedule_message(chat_id, prod_seconds=24 * 60 * 60, test_seconds=10, kind="final_block2")
 
