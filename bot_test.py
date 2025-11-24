@@ -190,10 +190,25 @@ def mark_message_delivered(task_id: int):
     conn.close()
 
 
+async def update_subscription_status(user_id: int) -> int:
+    try:
+        member = await bot.get_chat_member(CHANNEL_USERNAME.lstrip("@"), user_id)
+        is_sub = 1 if member.status in ("member", "administrator", "creator") else 0
+    except Exception as e:
+        log_event(user_id, "Ошибка проверки подписки", str(e))
+        is_sub = 0
+
+    upsert_user(user_id, subscribed=is_sub)
+    log_event(user_id, "Проверка подписки", f"subscribed={is_sub}")
+    return is_sub
+
+
 async def process_scheduled_message(task_id: int, user_id: int, kind: str, payload: str | None):
     try:
         if kind == "channel_invite":
-            await send_channel_invite(user_id)
+            is_sub = await update_subscription_status(user_id)
+            if not is_sub:
+                await send_channel_invite(user_id)
         elif kind == "avoidance_intro":
             await send_avoidance_intro(user_id)
         elif kind == "case_story":
@@ -372,7 +387,6 @@ async def send_material(callback: CallbackQuery):
         sent_pdf = await bot.send_message(chat_id, "⚠️ Файл не найден.")
         log_event(chat_id, "Не удалось найти файл гайда", LINK or "Путь не задан")
 
-    # ⚠️ КРИТИЧНО — передать payload=message_id
     payload_value = str(sent_pdf.message_id) if sent_pdf else "0"
 
     schedule_message(
@@ -392,7 +406,6 @@ async def send_material(callback: CallbackQuery):
     )
 
     await callback.answer()
-
 
 
 async def send_channel_invite(chat_id: int):
@@ -458,7 +471,6 @@ async def send_avoidance_intro(chat_id: int):
     msg = await bot.send_message(chat_id, text, reply_markup=kb)
     log_event(chat_id, "Показан блок с предложением теста", "Предложен опрос избегания")
 
-    # Если пользователь не нажал кнопку - через сутки / 30 секунд тестовый
     schedule_message(
         user_id=chat_id,
         prod_seconds=24 * 60 * 60,
@@ -473,7 +485,6 @@ async def start_avoidance_test(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     await callback.answer()
 
-    # Пользователь начал тест - отменяем автопереход к истории пациентки
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cursor = conn.cursor()
     cursor.execute(
