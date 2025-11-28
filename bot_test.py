@@ -6,7 +6,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ВСТАВЬ сюда токен тестового бота
-BOT_TOKEN = os.getenv("PDF_VIEWER_TEST_BOT_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_БОТА")
+BOT_TOKEN = 8376771386:AAF3gv-snD6Yd3xrwKSBwDVo2zBvQzd45S8
 
 PDF_URL = "https://xn----8sbnaardarcyey0i.xn--p1ai/wp-content/uploads/2025/11/Childhood-trauma-in.pdf"  # ← сюда вставь реальный URL на PDF
 
