@@ -12,7 +12,7 @@ import os
 # НАСТРОЙКИ
 # --------------------------------------------------------
 
-TOKEN = "ВСТАВЬ_СЮДА_ТОКЕН_ТЕСТОВОГО_БОТА"
+TOKEN = "8376771386:AAF3gv-snD6Yd3xrwKSBwDVo2zBvQzd45S8"
 
 SECRET = "ajd82jhAHD828hd82hds9"     # соль для токена
 PDF_SERVER_URL = "https://5.183.95.220:9100/secure-pdf"   # backend FastAPI
