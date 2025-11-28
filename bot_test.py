@@ -1,12 +1,11 @@
 import time
-from hashlib import sha256
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram import Router
 import asyncio
 import logging
-import os
+from hashlib import sha256
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 
 # --------------------------------------------------------
 # НАСТРОЙКИ
@@ -14,8 +13,8 @@ import os
 
 TOKEN = "8376771386:AAF3gv-snD6Yd3xrwKSBwDVo2zBvQzd45S8"
 
-SECRET = "ajd82jhAHD828hd82hds9"     # соль для токена
-PDF_SERVER_URL = "https://5.183.95.220:9100/secure-pdf"   # backend FastAPI
+SECRET = "ajd82jhAHD828hd82hds9"  # соль для токена
+PDF_SERVER_URL = "https://5.183.95.220:9100/secure-pdf"  # backend FastAPI
 TOKEN_TTL = 600  # 10 минут
 
 router = Router()
@@ -79,7 +78,12 @@ async def open_pdf_secure(callback: CallbackQuery):
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-    bot = Bot(token=TOKEN, parse_mode="HTML")
+
+    bot = Bot(
+        token=TOKEN,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
+
     dp = Dispatcher()
     dp.include_router(router)
 
