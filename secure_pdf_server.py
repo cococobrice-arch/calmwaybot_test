@@ -24,20 +24,21 @@ def generate_token(user_id: int) -> str:
 
 def verify_token(token: str) -> bool:
     try:
-        hash_part, expires = token.split(":")
+        hash_part, expires, user_id = token.split(":")
         expires = int(expires)
+        user_id = int(user_id)
 
         if expires < time.time():
             return False
 
-        # Пытаемся восстановить оригинальный хеш с разными user_id
-        # но в тесте проще сделать один user_id — 1
-        raw = f"1:{expires}:{SECRET}"
-        expected = hashlib.sha256(raw.encode()).hexdigest()
+        raw = f"{user_id}:{expires}:{SECRET}".encode()
+        expected = hashlib.sha256(raw).hexdigest()
 
         return expected == hash_part
+
     except:
         return False
+
 
 
 @app.get("/secure-pdf")

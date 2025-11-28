@@ -28,7 +28,7 @@ def generate_pdf_link(user_id: int) -> str:
     expires = int(time.time()) + TOKEN_TTL
     raw = f"{user_id}:{expires}:{SECRET}".encode()
     token = sha256(raw).hexdigest()
-    token_str = f"{token}:{expires}"
+    token_str = f"{token}:{expires}:{user_id}"
     return f"{PDF_SERVER_URL}?token={token_str}"
 
 
