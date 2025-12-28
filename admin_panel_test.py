@@ -1,12 +1,18 @@
 import os
 import sqlite3
 from datetime import datetime
+
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-DB_PATH = "/home/dmitry/calmwaybot_test/users_test.db"
+load_dotenv()
 
-app = FastAPI(title="CalmWayBot TEST Admin Panel")
+DB_PATH = os.getenv("DATABASE_PATH")
+if not DB_PATH:
+    raise RuntimeError("DATABASE_PATH is not set in .env")
+
+app = FastAPI(title="CalmWayBot Test — Admin Panel")
 
 STYLE = """
 <style>
@@ -118,9 +124,7 @@ def ensure_schema():
     conn.commit()
     conn.close()
 
-
 ensure_schema()
-
 
 def fmt_time(ts: str) -> str:
     if not ts:
@@ -129,7 +133,6 @@ def fmt_time(ts: str) -> str:
         return datetime.fromisoformat(ts).strftime("%Y-%m-%d – %H:%M")
     except:
         return ts
-
 
 def get_users():
     conn = sqlite3.connect(DB_PATH)
@@ -142,11 +145,6 @@ def get_users():
     rows = cursor.fetchall()
     conn.close()
     return rows
-
-
-# =====================================================================
-# ✔ САМЫЙ НАДЁЖНЫЙ В МИРЕ СПОСОБ: анализируем содержимое action/details
-# =====================================================================
 
 def has_consult_interest(user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
@@ -168,8 +166,7 @@ def has_consult_interest(user_id: int) -> bool:
 
     return False
 
-
-@app.get("/panel-database-test", response_class=HTMLResponse)
+@app.get("/panel-database", response_class=HTMLResponse)
 async def panel_main():
     users = get_users()
 
@@ -188,13 +185,13 @@ async def panel_main():
             <td>{subscribed_mark}</td>
             <td>{consult_mark}</td>
             <td>{last_action_fmt}</td>
-            <td><a href="/panel-database-test/user/{user_id}"><button>История</button></a></td>
+            <td><a href="/panel-database/user/{user_id}"><button>История</button></a></td>
         </tr>
         """
 
     html = f"""
     {STYLE}
-    <h1>CalmWayBot TEST — Users</h1>
+    <h1>CalmWayBot Test — Users</h1>
 
     <table>
         <tr>
@@ -216,8 +213,7 @@ async def panel_main():
 
     return html
 
-
-@app.get("/panel-database-test/user/{user_id}", response_class=HTMLResponse)
+@app.get("/panel-database/user/{user_id}", response_class=HTMLResponse)
 async def user_history(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -241,7 +237,7 @@ async def user_history(user_id: int):
     html = f"""
     {STYLE}
     <h1>История действий — {user_id}</h1>
-    <a href="/panel-database-test">⬅ Назад</a>
+    <a href="/panel-database">⬅ Назад</a>
 
     <table>
         <tr><th>Время</th><th>Действие</th><th>Детали</th></tr>
@@ -251,7 +247,7 @@ async def user_history(user_id: int):
 
     return html
 
-
 if __name__ == "__main__":
     import uvicorn
+    # порт оставь тот, который у тебя сейчас используется тестовой админкой
     uvicorn.run("admin_panel_test:app", host="0.0.0.0", port=8081)
