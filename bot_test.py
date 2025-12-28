@@ -27,7 +27,7 @@ DB_PATH = os.getenv("DATABASE_PATH")
 if not DB_PATH:
     raise RuntimeError("DATABASE_PATH is not set")
 
-CHANNEL_USERNAME = "@OcdAndAnxiety"
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@OcdAndAnxiety")
 
 MODE = os.getenv("MODE", "prod").lower()
 FAST_USER_ID_RAW = os.getenv("FAST_USER_ID", "")

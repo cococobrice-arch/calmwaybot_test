@@ -1,18 +1,23 @@
 import os
 import sqlite3
 from datetime import datetime
-
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-load_dotenv("/home/dmitry/calmwaybot_test/.env")
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
 
-DB_PATH = os.getenv("DATABASE_PATH")
-if not DB_PATH:
-    raise RuntimeError("DATABASE_PATH is not set in .env")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
 
-app = FastAPI(title="CalmWayBot — Admin Panel")
+if load_dotenv is not None:
+    load_dotenv(dotenv_path=ENV_PATH, override=False)
+
+DB_PATH = os.getenv("DATABASE_PATH") or os.getenv("DB_PATH") or os.path.join(BASE_DIR, "users.db")
+
+app = FastAPI(title="CalmWayBot Test - Admin Panel")
 
 STYLE = """
 <style>
@@ -25,6 +30,7 @@ STYLE = """
     --accent: #0077cc;
     --accent-hover: #005fa3;
 }
+
 @media (prefers-color-scheme: dark) {
     :root {
         --bg: #0d1117;
@@ -36,6 +42,7 @@ STYLE = """
         --accent-hover: #2ea043;
     }
 }
+
 body {
     background-color: var(--bg);
     color: var(--fg);
@@ -43,119 +50,216 @@ body {
     margin: 0;
     padding: 20px;
 }
-h1 { color: var(--accent); margin-bottom: 20px; }
+
+h1 {
+    color: var(--accent);
+    margin-bottom: 10px;
+}
+
+.small-note {
+    opacity: 0.75;
+    font-size: 12px;
+    margin-bottom: 18px;
+}
+
 table {
     width: 100%;
     border-collapse: collapse;
     margin-top: 15px;
     background-color: var(--table-bg);
+    border-radius: 6px;
+    overflow: hidden;
 }
+
 th, td {
     border: 1px solid var(--table-border);
     padding: 10px;
+    text-align: left;
 }
+
 th {
     background-color: var(--table-header-bg);
     color: var(--accent);
+    font-weight: bold;
 }
+
 tr:hover {
     background-color: var(--accent-hover);
     color: white;
 }
+
 button {
     background-color: var(--accent);
     color: white;
     border: none;
     padding: 8px 14px;
     border-radius: 6px;
+    cursor: pointer;
 }
-button:hover { background-color: var(--accent-hover); }
+
+button:hover {
+    background-color: var(--accent-hover);
+}
+
+a {
+    color: var(--accent);
+}
 </style>
 """
 
-def connect():
-    return sqlite3.connect(DB_PATH)
-
 def ensure_schema():
-    with connect() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                source TEXT,
-                step TEXT,
-                subscribed INTEGER DEFAULT 0,
-                last_action TEXT,
-                username TEXT
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                timestamp TEXT,
-                action TEXT,
-                details TEXT
-            )
-        """)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            source TEXT,
+            step TEXT,
+            subscribed INTEGER DEFAULT 0,
+            last_action TEXT,
+            username TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            timestamp TEXT,
+            action TEXT,
+            details TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
 
 ensure_schema()
 
-def fmt(ts):
+def fmt_time(ts: str) -> str:
     if not ts:
         return "-"
     try:
         return datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M")
-    except:
+    except Exception:
         return ts
 
+def get_users():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT user_id, source, step, subscribed, last_action, username
+        FROM users
+        ORDER BY last_action DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
 def has_consult_interest(user_id: int) -> bool:
-    with connect() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT action, details FROM events WHERE user_id=?", (user_id,))
-        for action, details in cur.fetchall():
-            if "консультац" in f"{action} {details}".lower():
-                return True
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT action, details
+        FROM events
+        WHERE user_id = ?
+    """, (user_id,))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    for action, details in rows:
+        text = f"{action} {details}".lower()
+        if "консультац" in text:
+            return True
+
     return False
 
 @app.get("/panel-database", response_class=HTMLResponse)
-async def panel():
-    with connect() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT user_id, source, step, subscribed, last_action, username
-            FROM users ORDER BY last_action DESC
-        """)
-        users = cur.fetchall()
+async def panel_main():
+    users = get_users()
 
-    rows = ""
-    for u in users:
-        uid, source, step, sub, last, username = u
-        rows += f"""
+    rows_html = ""
+    for user_id, source, step, subscribed, last_action, username in users:
+        subscribed_mark = "✅" if subscribed else "-"
+        consult_mark = "✅" if has_consult_interest(user_id) else "-"
+        display_name = f"@{username}" if username else str(user_id)
+        last_action_fmt = fmt_time(last_action)
+
+        rows_html += f"""
         <tr>
-            <td>@{username or uid}</td>
+            <td>{display_name}</td>
             <td>{source}</td>
             <td>{step}</td>
-            <td>{"✅" if sub else "—"}</td>
-            <td>{"✅" if has_consult_interest(uid) else "—"}</td>
-            <td>{fmt(last)}</td>
-            <td><a href="/panel-database/user/{uid}"><button>История</button></a></td>
+            <td>{subscribed_mark}</td>
+            <td>{consult_mark}</td>
+            <td>{last_action_fmt}</td>
+            <td><a href="/panel-database/user/{user_id}"><button>История</button></a></td>
         </tr>
         """
 
-    return f"""
+    html = f"""
     {STYLE}
-    <h1>CalmWayBot — Users</h1>
+    <h1>CalmWayBot Test - Users</h1>
+    <div class="small-note">DB: {DB_PATH}</div>
+
     <table>
         <tr>
-            <th>Пользователь</th><th>Источник</th><th>Этап</th>
-            <th>Подписан</th><th>Интерес</th><th>Последнее</th><th></th>
+            <th>Пользователь</th>
+            <th>Источник</th>
+            <th>Этап</th>
+            <th>Подписан</th>
+            <th>Интерес к консультации</th>
+            <th>Последнее действие</th>
+            <th></th>
         </tr>
+        {rows_html}
+    </table>
+
+    <script>
+        setTimeout(() => location.reload(), 10000);
+    </script>
+    """
+
+    return html
+
+@app.get("/panel-database/user/{user_id}", response_class=HTMLResponse)
+async def user_history(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT timestamp, action, details
+        FROM events
+        WHERE user_id=?
+        ORDER BY id ASC
+    """, (user_id,))
+    events = cursor.fetchall()
+    conn.close()
+
+    if not events:
+        rows = "<tr><td colspan='3'>Нет записей</td></tr>"
+    else:
+        rows = "".join(
+            f"<tr><td>{fmt_time(ts)}</td><td>{action}</td><td>{details or '-'}</td></tr>"
+            for ts, action, details in events
+        )
+
+    html = f"""
+    {STYLE}
+    <h1>История действий - {user_id}</h1>
+    <div class="small-note">DB: {DB_PATH}</div>
+    <a href="/panel-database">Назад</a>
+
+    <table>
+        <tr><th>Время</th><th>Действие</th><th>Детали</th></tr>
         {rows}
     </table>
-    <script>setTimeout(()=>location.reload(),10000)</script>
     """
+
+    return html
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("admin_panel:app", host="0.0.0.0", port=8080)
+    uvicorn.run("admin_panel_test:app", host="0.0.0.0", port=8081)
