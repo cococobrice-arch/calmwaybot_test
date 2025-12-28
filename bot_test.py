@@ -481,7 +481,7 @@ async def send_channel_invite(chat_id: int):
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Подписаться", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}")]
+            [InlineKeyboardButton(text="Подписаться", url="https://t.me/+mfqalBhytdMyMWMy")]
         ]
     )
 
