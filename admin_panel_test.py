@@ -1,6 +1,7 @@
 import os
 import sqlite3
 from datetime import datetime
+from datetime import timedelta
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
@@ -104,6 +105,46 @@ button:hover {
 a {
     color: var(--accent);
 }
+
+.stats-block {
+    margin-top: 20px;
+    padding: 16px;
+    border: 1px solid var(--table-border);
+    border-radius: 8px;
+    background-color: var(--table-bg);
+}
+
+.stats-block h2 {
+    margin-top: 0;
+    color: var(--accent);
+}
+
+.stats-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+}
+
+.stats-table th,
+.stats-table td {
+    border: 1px solid var(--table-border);
+    padding: 8px;
+}
+
+.stats-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: flex-end;
+    margin-top: 12px;
+}
+
+.stats-form label {
+    display: flex;
+    flex-direction: column;
+    font-size: 12px;
+    gap: 4px;
+}
 </style>
 """
 
@@ -157,6 +198,34 @@ def get_users():
     conn.close()
     return rows
 
+def build_source_filter(source: str) -> tuple[str, list]:
+    if source == "unknown":
+        return "(source IS NULL OR source = '' OR source = 'unknown')", []
+    if source:
+        return "source = ?", [source]
+    return "1=1", []
+
+def get_new_users_stats(start_at: datetime, end_at: datetime, source: str) -> tuple[int, int]:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    source_clause, params = build_source_filter(source)
+    params = params + [start_at.isoformat(), end_at.isoformat()]
+
+    cursor.execute(
+        f"""
+        SELECT COUNT(*), COALESCE(SUM(subscribed), 0)
+        FROM users
+        WHERE {source_clause}
+          AND last_action >= ?
+          AND last_action <= ?
+        """,
+        params,
+    )
+    total, subscribed = cursor.fetchone()
+    conn.close()
+    return int(total or 0), int(subscribed or 0)
+
 def has_consult_interest(user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -178,8 +247,51 @@ def has_consult_interest(user_id: int) -> bool:
     return False
 
 @app.get("/panel-database", response_class=HTMLResponse)
-async def panel_main():
+async def panel_main(start_date: str = "", end_date: str = "", source: str = ""):
     users = get_users()
+
+    now = datetime.now()
+    yandex_source = "yandex_direct"
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = now - timedelta(days=7)
+    month_start = now - timedelta(days=30)
+
+    today_total, today_subscribed = get_new_users_stats(today_start, now, yandex_source)
+    week_total, week_subscribed = get_new_users_stats(week_start, now, yandex_source)
+    month_total, month_subscribed = get_new_users_stats(month_start, now, yandex_source)
+
+    custom_stats = None
+    custom_error = ""
+    custom_stats_html = ""
+    if start_date and end_date and source:
+        try:
+            custom_start = datetime.fromisoformat(start_date)
+            custom_end = datetime.fromisoformat(end_date).replace(hour=23, minute=59, second=59)
+            if custom_end < custom_start:
+                raise ValueError("Некорректный диапазон")
+            custom_total, custom_subscribed = get_new_users_stats(custom_start, custom_end, source)
+            custom_stats = (custom_total, custom_subscribed)
+        except Exception:
+            custom_error = "Не удалось обработать выбранный период. Проверьте даты."
+
+    if custom_stats:
+        source_label = "Неизвестный" if source == "unknown" else ("Телеграм" if source == "telegram" else "Яндекс Директ")
+        custom_stats_html = f"""
+        <table class='stats-table'>
+            <tr>
+                <th>Период</th>
+                <th>Источник</th>
+                <th>Новые пользователи</th>
+                <th>Подписались на канал</th>
+            </tr>
+            <tr>
+                <td>{start_date} - {end_date}</td>
+                <td>{source_label}</td>
+                <td>{custom_stats[0]}</td>
+                <td>{custom_stats[1]}</td>
+            </tr>
+        </table>
+        """
 
     rows_html = ""
     for user_id, source, step, subscribed, last_action, username in users:
@@ -204,6 +316,59 @@ async def panel_main():
     {STYLE}
     <h1>CalmWayBot Test - Users</h1>
     <div class="small-note">DB: {DB_PATH}</div>
+
+    <div class="stats-block">
+        <h2>Новые пользователи по источнику</h2>
+        <table class="stats-table">
+            <tr>
+                <th>Период</th>
+                <th>Описание</th>
+                <th>Новые пользователи</th>
+                <th>Подписались на канал</th>
+            </tr>
+            <tr>
+                <td>Сегодня</td>
+                <td>Новые пользователи из Яндекс Директ</td>
+                <td>{today_total}</td>
+                <td>{today_subscribed}</td>
+            </tr>
+            <tr>
+                <td>Неделя</td>
+                <td>Новые пользователи из Яндекс Директ</td>
+                <td>{week_total}</td>
+                <td>{week_subscribed}</td>
+            </tr>
+            <tr>
+                <td>Месяц</td>
+                <td>Новые пользователи из Яндекс Директ</td>
+                <td>{month_total}</td>
+                <td>{month_subscribed}</td>
+            </tr>
+        </table>
+
+        <form class="stats-form" method="get">
+            <label>
+                Начало периода
+                <input type="date" name="start_date" value="{start_date}" required>
+            </label>
+            <label>
+                Конец периода
+                <input type="date" name="end_date" value="{end_date}" required>
+            </label>
+            <label>
+                Источник
+                <select name="source" required>
+                    <option value="" {'selected' if not source else ''}>Выберите источник</option>
+                    <option value="unknown" {'selected' if source == 'unknown' else ''}>Неизвестный</option>
+                    <option value="telegram" {'selected' if source == 'telegram' else ''}>Телеграм</option>
+                    <option value="yandex_direct" {'selected' if source == 'yandex_direct' else ''}>Яндекс Директ</option>
+                </select>
+            </label>
+            <button type="submit">Показать</button>
+        </form>
+        {f"<div class='small-note'>{custom_error}</div>" if custom_error else ""}
+        {custom_stats_html}
+    </div>
 
     <table>
         <tr>
