@@ -148,11 +148,13 @@ a {
 </style>
 """
 
+
 def ensure_schema():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    cursor.execute("""
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             source TEXT,
@@ -161,9 +163,11 @@ def ensure_schema():
             last_action TEXT,
             username TEXT
         )
-    """)
+    """
+    )
 
-    cursor.execute("""
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -171,12 +175,15 @@ def ensure_schema():
             action TEXT,
             details TEXT
         )
-    """)
+    """
+    )
 
     conn.commit()
     conn.close()
 
+
 ensure_schema()
+
 
 def fmt_time(ts: str) -> str:
     if not ts:
@@ -186,29 +193,46 @@ def fmt_time(ts: str) -> str:
     except Exception:
         return ts
 
+
 def get_users():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT user_id, source, step, subscribed, last_action, username
         FROM users
         ORDER BY last_action DESC
-    """)
+    """
+    )
     rows = cursor.fetchall()
     conn.close()
     return rows
 
+
+def get_time_column() -> str:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(users)")
+    columns = {row[1] for row in cursor.fetchall()}
+    conn.close()
+    return "created_at" if "created_at" in columns else "last_action"
+
+
 def build_source_filter(source: str) -> tuple[str, list]:
     if source == "unknown":
         return "(source IS NULL OR source = '' OR source = 'unknown')", []
+    if source in {"telegram-channel", "telegram"}:
+        return "(source = 'telegram-channel' OR source = 'telegram')", []
     if source:
         return "source = ?", [source]
     return "1=1", []
+
 
 def get_new_users_stats(start_at: datetime, end_at: datetime, source: str) -> tuple[int, int]:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
+    time_column = get_time_column()
     source_clause, params = build_source_filter(source)
     params = params + [start_at.isoformat(), end_at.isoformat()]
 
@@ -217,8 +241,8 @@ def get_new_users_stats(start_at: datetime, end_at: datetime, source: str) -> tu
         SELECT COUNT(*), COALESCE(SUM(subscribed), 0)
         FROM users
         WHERE {source_clause}
-          AND last_action >= ?
-          AND last_action <= ?
+          AND {time_column} >= ?
+          AND {time_column} < ?
         """,
         params,
     )
@@ -226,15 +250,19 @@ def get_new_users_stats(start_at: datetime, end_at: datetime, source: str) -> tu
     conn.close()
     return int(total or 0), int(subscribed or 0)
 
+
 def has_consult_interest(user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT action, details
         FROM events
         WHERE user_id = ?
-    """, (user_id,))
+    """,
+        (user_id,),
+    )
 
     rows = cursor.fetchall()
     conn.close()
@@ -246,8 +274,8 @@ def has_consult_interest(user_id: int) -> bool:
 
     return False
 
-@app.get("/panel-database", response_class=HTMLResponse)
-async def panel_main(start_date: str = "", end_date: str = "", source: str = ""):
+
+def render_panel(start_date: str = "", end_date: str = "", source: str = "") -> str:
     users = get_users()
 
     now = datetime.now()
@@ -260,41 +288,31 @@ async def panel_main(start_date: str = "", end_date: str = "", source: str = "")
     week_total, week_subscribed = get_new_users_stats(week_start, now, yandex_source)
     month_total, month_subscribed = get_new_users_stats(month_start, now, yandex_source)
 
-    custom_stats = None
     custom_error = ""
     custom_stats_html = ""
+    custom_summary_text = ""
     if start_date and end_date and source:
         try:
             custom_start = datetime.fromisoformat(start_date)
-            custom_end = datetime.fromisoformat(end_date).replace(hour=23, minute=59, second=59)
-            if custom_end < custom_start:
+            custom_end = datetime.fromisoformat(end_date) + timedelta(days=1)
+            if custom_end <= custom_start:
                 raise ValueError("Некорректный диапазон")
             custom_total, custom_subscribed = get_new_users_stats(custom_start, custom_end, source)
-            custom_stats = (custom_total, custom_subscribed)
+            source_label = source
+            if source == "unknown":
+                source_label = "unknown"
+            elif source in {"telegram", "telegram-channel"}:
+                source_label = "telegram-channel"
+            custom_summary_text = (
+                f"Новые пользователи за период {start_date}-{end_date} "
+                f"из источника {source_label}: {custom_total}, из них подписались: {custom_subscribed}"
+            )
+            custom_stats_html = f"<div class='small-note'>{custom_summary_text}</div>"
         except Exception:
             custom_error = "Не удалось обработать выбранный период. Проверьте даты."
 
-    if custom_stats:
-        source_label = "Неизвестный" if source == "unknown" else ("Телеграм" if source == "telegram" else "Яндекс Директ")
-        custom_stats_html = f"""
-        <table class='stats-table'>
-            <tr>
-                <th>Период</th>
-                <th>Источник</th>
-                <th>Новые пользователи</th>
-                <th>Подписались на канал</th>
-            </tr>
-            <tr>
-                <td>{start_date} - {end_date}</td>
-                <td>{source_label}</td>
-                <td>{custom_stats[0]}</td>
-                <td>{custom_stats[1]}</td>
-            </tr>
-        </table>
-        """
-
     rows_html = ""
-    for user_id, source, step, subscribed, last_action, username in users:
+    for user_id, source_value, step, subscribed, last_action, username in users:
         subscribed_mark = "✅" if subscribed else "-"
         consult_mark = "✅" if has_consult_interest(user_id) else "-"
         display_name = f"@{username}" if username else str(user_id)
@@ -303,7 +321,7 @@ async def panel_main(start_date: str = "", end_date: str = "", source: str = "")
         rows_html += f"""
         <tr>
             <td>{display_name}</td>
-            <td>{source}</td>
+            <td>{source_value}</td>
             <td>{step}</td>
             <td>{subscribed_mark}</td>
             <td>{consult_mark}</td>
@@ -323,29 +341,22 @@ async def panel_main(start_date: str = "", end_date: str = "", source: str = "")
             <tr>
                 <th>Период</th>
                 <th>Описание</th>
-                <th>Новые пользователи</th>
-                <th>Подписались на канал</th>
             </tr>
             <tr>
                 <td>Сегодня</td>
-                <td>Новые пользователи из Яндекс Директ</td>
-                <td>{today_total}</td>
-                <td>{today_subscribed}</td>
+                <td>Новые пользователи из Яндекс Директ за сегодня: {today_total}, из них подписались: {today_subscribed}</td>
             </tr>
             <tr>
                 <td>Неделя</td>
-                <td>Новые пользователи из Яндекс Директ</td>
-                <td>{week_total}</td>
-                <td>{week_subscribed}</td>
+                <td>Новые пользователи из Яндекс Директ за неделю: {week_total}, из них подписались: {week_subscribed}</td>
             </tr>
             <tr>
                 <td>Месяц</td>
-                <td>Новые пользователи из Яндекс Директ</td>
-                <td>{month_total}</td>
-                <td>{month_subscribed}</td>
+                <td>Новые пользователи из Яндекс Директ за месяц: {month_total}, из них подписались: {month_subscribed}</td>
             </tr>
         </table>
 
+        <h3>Custom period</h3>
         <form class="stats-form" method="get">
             <label>
                 Начало периода
@@ -359,9 +370,9 @@ async def panel_main(start_date: str = "", end_date: str = "", source: str = "")
                 Источник
                 <select name="source" required>
                     <option value="" {'selected' if not source else ''}>Выберите источник</option>
-                    <option value="unknown" {'selected' if source == 'unknown' else ''}>Неизвестный</option>
-                    <option value="telegram" {'selected' if source == 'telegram' else ''}>Телеграм</option>
-                    <option value="yandex_direct" {'selected' if source == 'yandex_direct' else ''}>Яндекс Директ</option>
+                    <option value="unknown" {'selected' if source == 'unknown' else ''}>unknown</option>
+                    <option value="telegram-channel" {'selected' if source in {'telegram-channel', 'telegram'} else ''}>telegram-channel</option>
+                    <option value="yandex_direct" {'selected' if source == 'yandex_direct' else ''}>yandex_direct</option>
                 </select>
             </label>
             <button type="submit">Показать</button>
@@ -390,16 +401,30 @@ async def panel_main(start_date: str = "", end_date: str = "", source: str = "")
 
     return html
 
+
+@app.get("/panel-database", response_class=HTMLResponse)
+async def panel_main(start_date: str = "", end_date: str = "", source: str = ""):
+    return render_panel(start_date, end_date, source)
+
+
+@app.get("/panel-database-test", response_class=HTMLResponse)
+async def panel_database_test(start_date: str = "", end_date: str = "", source: str = ""):
+    return render_panel(start_date, end_date, source)
+
+
 @app.get("/panel-database/user/{user_id}", response_class=HTMLResponse)
 async def user_history(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT timestamp, action, details
         FROM events
         WHERE user_id=?
         ORDER BY id ASC
-    """, (user_id,))
+    """,
+        (user_id,),
+    )
     events = cursor.fetchall()
     conn.close()
 
@@ -425,6 +450,8 @@ async def user_history(user_id: int):
 
     return html
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("admin_panel_test:app", host="0.0.0.0", port=8081)
