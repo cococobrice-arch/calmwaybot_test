@@ -295,6 +295,7 @@ async def cmd_start(message: Message):
         source = "telegram-channel"
     elif param in ("yandex", "yandex_direct", "yd"):
         source = "yandex-direct"
+
     # ------------------------------
 
     TEST_USER_ID = int(os.getenv("FAST_USER_ID", "0") or 0)
