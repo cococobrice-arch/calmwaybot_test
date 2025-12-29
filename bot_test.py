@@ -290,9 +290,11 @@ async def cmd_start(message: Message):
     source = "unknown"
     parts = message.text.split(" ", 1)
     if len(parts) > 1:
-        param = parts[1].strip()
-        if param == "channel":
-            source = "telegram-channel"
+    param = parts[1].strip()
+    if param == "channel":
+        source = "telegram-channel"
+    elif param in ("yandex", "yandex_direct", "yd"):
+        source = "yandex-direct"
     # ------------------------------
 
     TEST_USER_ID = int(os.getenv("FAST_USER_ID", "0") or 0)
